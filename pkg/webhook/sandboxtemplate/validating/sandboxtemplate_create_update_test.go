@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,38 @@ import (
 
 	"github.com/openkruise/agents/api/v1alpha1"
 )
+
+// minimalPodTemplate builds a pod template that passes the unrelated template
+// validations, so a case can fail only on what it is testing.
+func minimalPodTemplate() *corev1.PodTemplateSpec {
+	return &corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			RestartPolicy:                 corev1.RestartPolicyAlways,
+			DNSPolicy:                     corev1.DNSClusterFirst,
+			TerminationGracePeriodSeconds: new(int64),
+			Containers: []corev1.Container{
+				{
+					Name:                     "test",
+					Image:                    "nginx:latest",
+					ImagePullPolicy:          corev1.PullAlways,
+					TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+				},
+			},
+		},
+	}
+}
+
+// newExecProbe builds a minimal valid exec probe for the validation cases.
+func newExecProbe(name string, command ...string) v1alpha1.Probe {
+	return v1alpha1.Probe{
+		Name: name,
+		Probe: corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: command},
+			},
+		},
+	}
+}
 
 func TestSandboxTemplateValidatingHandler_Handle(t *testing.T) {
 	// Add v1alpha1 to scheme
@@ -109,6 +142,52 @@ func TestSandboxTemplateValidatingHandler_Handle(t *testing.T) {
 			errorMessage: "subdomain must consist of lower case alphanumeric characters, '-' or '.'",
 		},
 		{
+			name: "Valid SandboxTemplate With VolumeClaimTemplate",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbt",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxTemplateSpec{
+					Template: &corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							RestartPolicy:                 corev1.RestartPolicyAlways,
+							DNSPolicy:                     corev1.DNSClusterFirst,
+							TerminationGracePeriodSeconds: new(int64),
+							Containers: []corev1.Container{
+								{
+									Name:                     "test",
+									Image:                    "nginx:latest",
+									ImagePullPolicy:          corev1.PullAlways,
+									TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+									VolumeMounts: []corev1.VolumeMount{
+										{
+											Name:      "data-vol",
+											MountPath: "/data",
+										},
+									},
+								},
+							},
+						},
+					},
+					VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "data-vol",
+							},
+							Spec: corev1.PersistentVolumeClaimSpec{
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									corev1.ReadWriteOnce,
+								},
+							},
+						},
+					},
+				},
+			},
+			expectAllow: true,
+			expectError: false,
+		},
+		{
 			name: "Label with internal prefix",
 			sandboxTemplate: &v1alpha1.SandboxTemplate{
 				ObjectMeta: metav1.ObjectMeta{
@@ -152,6 +231,119 @@ func TestSandboxTemplateValidatingHandler_Handle(t *testing.T) {
 			expectAllow:  false,
 			expectError:  true,
 			errorMessage: "label cannot start with " + v1alpha1.E2BPrefix,
+		},
+		{
+			name: "Missing template",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "template is required",
+		},
+		{
+			// Probes and the policy propagate to every Sandbox created from this
+			// template, so they are validated here even though the template itself
+			// never runs a probe.
+			name: "Valid probes and autoPausePolicy",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbt",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxTemplateSpec{
+					Template: minimalPodTemplate(),
+					Probes:   []v1alpha1.Probe{newExecProbe("idle", "cat", "/tmp/idle")},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Pause: &v1alpha1.PausePolicy{
+							WhenProbedIdleState: &v1alpha1.ProbedIdleStateRule{
+								Probe:             "idle",
+								MessageRegex:      "^idle$",
+								ThresholdDuration: &metav1.Duration{Duration: time.Minute},
+							},
+						},
+					},
+				},
+			},
+			expectAllow: true,
+		},
+		{
+			name: "Valid ingress traffic autoPausePolicy without probes",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbt",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxTemplateSpec{
+					Template: minimalPodTemplate(),
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Resume: &v1alpha1.ResumePolicy{
+							OnIngressTraffic: &v1alpha1.IngressTrafficRule{},
+						},
+					},
+				},
+			},
+			expectAllow: true,
+		},
+		{
+			name: "Invalid probe - duplicate name",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbt",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxTemplateSpec{
+					Template: minimalPodTemplate(),
+					Probes: []v1alpha1.Probe{
+						newExecProbe("idle", "cat", "/tmp/a"),
+						newExecProbe("idle", "cat", "/tmp/b"),
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "Duplicate value",
+		},
+		{
+			name: "Invalid autoPausePolicy - resume rule references undefined probe",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbt",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxTemplateSpec{
+					Template: minimalPodTemplate(),
+					Probes:   []v1alpha1.Probe{newExecProbe("idle", "cat", "/tmp/idle")},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Resume: &v1alpha1.ResumePolicy{
+							WhenProbedScheduleTime: &v1alpha1.ProbedScheduleTimeRule{Probe: "schedule"},
+						},
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "must reference a probe name defined in spec.probes",
+		},
+		{
+			// The probe rules are reported even when the template itself is missing,
+			// so a single apply does not have to be fixed one error at a time.
+			name: "Invalid probe reported alongside missing template",
+			sandboxTemplate: &v1alpha1.SandboxTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbt",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxTemplateSpec{
+					Probes: []v1alpha1.Probe{newExecProbe("idle")},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "exec command is required",
 		},
 	}
 

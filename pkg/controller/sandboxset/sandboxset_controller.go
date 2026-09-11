@@ -21,9 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"math"
 	"reflect"
-	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,7 +30,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -63,13 +60,14 @@ var (
 	controllerKind       = agentsv1alpha1.GroupVersion.WithKind("SandboxSet")
 )
 
-func Add(mgr manager.Manager) error {
+func Add(mgr manager.Manager, sbxMaxPendingTimeout time.Duration) error {
 	if !utilfeature.DefaultFeatureGate.Enabled(features.SandboxSetGate) || !discovery.DiscoverGVK(controllerKind) {
 		return nil
 	}
 	err := (&Reconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		sbxMaxPendingTimeout: sbxMaxPendingTimeout,
 	}).SetupWithManager(mgr)
 	if err != nil {
 		return err
@@ -81,9 +79,10 @@ func Add(mgr manager.Manager) error {
 // Reconciler reconciles a Sandbox object
 type Reconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
-	Codec    runtime.Codec
+	Scheme               *runtime.Scheme
+	Recorder             record.EventRecorder
+	Codec                runtime.Codec
+	sbxMaxPendingTimeout time.Duration
 }
 
 const (
@@ -115,6 +114,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	// Owner-ref GC handles dependents; do not scale, update, or rewrite status
+	// while the SandboxSet is terminating.
+	if !sbs.DeletionTimestamp.IsZero() {
+		log.Info("sandboxset is deleting, skip reconcile")
+		return ctrl.Result{}, nil
+	}
+
 	recordSandboxSetMetrics(sbs)
 
 	// Preparation
@@ -135,9 +141,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var requeueAfter time.Duration
 	scaleUpSatisfied, dirtyScaleUp, scaleUpTimeoutAfter := scaleExpectationSatisfied(ctx, scaleUpExpectation, controllerKey)
 	scaleDownSatisfied, _, scaleDownTimeoutAfter := scaleExpectationSatisfied(ctx, scaleDownExpectation, controllerKey)
-	requeueAfter = min(scaleUpTimeoutAfter, scaleDownTimeoutAfter)
 
 	calculateSandboxSetStatusFromGroup(ctx, newStatus, groups, dirtyScaleUp)
+	now := time.Now()
+	blockers, scalingLimitedTimeoutAfter := r.calculateScalingLimited(ctx, sbs, newStatus, groups, now)
+	blockers.DirtyCreates = len(dirtyScaleUp[expectations.Create])
+	requeueAfter = minimumPositiveDuration(scaleUpTimeoutAfter, scaleDownTimeoutAfter, scalingLimitedTimeoutAfter)
 	// Set selector in status for scale subresource
 	if newStatus.Selector == "" {
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
@@ -156,9 +165,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var allErrors error
 	// Step 1: perform scale
 	start := time.Now()
-	delta := calculateScaleDelta(sbs, newStatus)
+	delta := calculateScaleDelta(ctx, sbs, newStatus, blockers)
 	log.Info("performing scale", "expect", sbs.Spec.Replicas, "actual", newStatus.Replicas,
-		"available", newStatus.AvailableReplicas, "delta", delta)
+		"available", newStatus.AvailableReplicas, "failed", blockers.Failed, "timedOut", blockers.TimedOut,
+		"dirtyCreates", blockers.DirtyCreates, "delta", delta)
 	if delta > 0 {
 		err = r.scaleUp(ctx, delta, sbs, newStatus.UpdateRevision)
 	} else if delta < 0 {
@@ -275,8 +285,12 @@ func (r *Reconciler) scaleDown(ctx context.Context, count int, sbs *agentsv1alph
 		return err
 	}
 
+	lessByScaleDownPriority := func(i, j *agentsv1alpha1.Sandbox) bool {
+		return compareScaleDownPriority(i, j) < 0
+	}
+
 	// Phase 1: Delete old revision sandboxes first
-	oldToDelete := oldCandidates[:min(count, len(oldCandidates))]
+	oldToDelete := findOldestSandboxes(oldCandidates, count, lessByScaleDownPriority)
 	var totalSuccesses int
 	successes, err := utils.DoItSlowlyWithInputs(oldToDelete, initialBatchSize, deleteFunc)
 	totalSuccesses += successes
@@ -292,8 +306,7 @@ func (r *Reconciler) scaleDown(ctx context.Context, count int, sbs *agentsv1alph
 
 	// Phase 2: Delete updated revision sandboxes if more needed.
 	// Priority: Pending > Recycled (recycledCount desc) > Running-NotReady > Available fresh.
-	slices.SortFunc(updatedCandidates, compareScaleDownPriority)
-	updatedToDelete := updatedCandidates[:min(remaining, len(updatedCandidates))]
+	updatedToDelete := findOldestSandboxes(updatedCandidates, remaining, lessByScaleDownPriority)
 	successes, err = utils.DoItSlowlyWithInputs(updatedToDelete, initialBatchSize, deleteFunc)
 	totalSuccesses += successes
 	if err != nil {
@@ -334,33 +347,34 @@ func compareScaleDownPriority(a, b *agentsv1alpha1.Sandbox) int {
 	return a.CreationTimestamp.Time.Compare(b.CreationTimestamp.Time)
 }
 
-// calculateScaleDelta calculates the delta for scaling, considering MaxUnavailable limit.
-// Returns positive value for scale up, negative for scale down, 0 for no scaling needed.
-func calculateScaleDelta(sbs *agentsv1alpha1.SandboxSet, newStatus *agentsv1alpha1.SandboxSetStatus) int {
+// calculateScaleDelta calculates the delta for scaling, considering the
+// MaxUnavailable limit. Returns a positive value for scale up, negative for
+// scale down, 0 for no scaling needed.
+//
+// The scale-up budget is charged by startup blockers: failed sandboxes,
+// Creating/ResourcePending sandboxes past the pending timeout, and dirty
+// creates issued but not yet observed by the cache. Healthy observed Creating
+// sandboxes do not consume the budget.
+func calculateScaleDelta(ctx context.Context, sbs *agentsv1alpha1.SandboxSet, newStatus *agentsv1alpha1.SandboxSetStatus, blockers startupBlockers) int {
 	delta := int(sbs.Spec.Replicas - newStatus.Replicas)
 	// scale down
 	if delta <= 0 {
 		return delta
 	}
 
-	// apply maxUnavailable limit only for scale up
-	scaleMaxUnavailable := math.MaxInt
-	if sbs.Spec.ScaleStrategy.MaxUnavailable != nil {
-		scaleMaxUnavailable, _ = intstrutil.GetScaledValueFromIntOrPercent(
-			intstrutil.ValueOrDefault(sbs.Spec.ScaleStrategy.MaxUnavailable, intstrutil.FromInt32(math.MaxInt32)),
-			int(sbs.Spec.Replicas),
-			true)
-		// subtract sandboxes that are currently being creating
-		scaleMaxUnavailable -= int(newStatus.Replicas - newStatus.AvailableReplicas)
-	}
-	// ignore negative values
-	if scaleMaxUnavailable < 0 {
-		scaleMaxUnavailable = 0
-	}
-	// delta cannot exceed scaleMaxUnavailable
-	if delta > scaleMaxUnavailable {
-		delta = scaleMaxUnavailable
-	}
+	// Apply maxUnavailable only to physical scale-up execution. The percentage
+	// base is Spec.Replicas so an empty pool can still ramp up at the configured
+	// rate; the startup-budget condition in scaling_limited.go uses observed
+	// replicas separately for its own accounting.
+	scaleMaxUnavailable := resolveMaxUnavailable(ctx, sbs.Spec.ScaleStrategy.MaxUnavailable, sbs.Spec.Replicas)
+	// Subtract sandboxes blocking startup plus unobserved dirty creates. Dirty
+	// creates keep the budget conservative until the cache confirms them as
+	// healthy Creating sandboxes, which release their slot.
+	scaleMaxUnavailable -= blockers.total()
+	// Ignore negative values.
+	scaleMaxUnavailable = max(scaleMaxUnavailable, 0)
+	// Delta cannot exceed maxUnavailable headroom.
+	delta = min(delta, scaleMaxUnavailable)
 
 	return delta
 }

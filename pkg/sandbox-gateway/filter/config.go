@@ -55,15 +55,35 @@ type Config struct {
 	HostHeaderName string `json:"host-header-name,omitempty"`
 	// DefaultPort is the default port if not specified
 	DefaultPort string `json:"default-port,omitempty"`
-	// EnableAuth enables access token authentication when set to true.
-	// When disabled (default), the gateway skips token validation for backward compatibility.
+	// EnableAuth enables the UUID access-token baseline for routes that have not
+	// opted into JWT enforcement. When disabled (default), those routes skip token
+	// validation for backward compatibility.
 	EnableAuth bool `json:"enable-auth,omitempty"`
-	// EnableJWTAuth switches enabled gateway authentication from UUID to JWT.
+	// EnableJWTAuth initializes the process-wide JWT capability, which enforces
+	// JWT verification on the routes that opt in through the Sandbox annotation.
+	// It is independent of EnableAuth: the two switches govern disjoint sets of
+	// routes, so enabling JWT never changes how a non-opted-in route is
+	// authenticated. That keeps both migration paths compatible: a deployment
+	// already on UUID keeps its baseline, and a deployment with authentication
+	// off keeps letting existing traffic through.
 	EnableJWTAuth bool `json:"enable-jwt-auth,omitempty"`
 	// TrafficAccessTokenHeader is the request header carrying the traffic access JWT.
 	TrafficAccessTokenHeader string `json:"traffic-access-token-header,omitempty"`
 	// EnableRuntimeMTLS routes requests to the agent-runtime port through the mTLS upstream cluster.
 	EnableRuntimeMTLS bool `json:"enable-runtime-mtls,omitempty"`
+	// EnableWakeOnTraffic enables wake-on-traffic for paused sandboxes.
+	// When true, the gateway will attempt to resume a paused sandbox by
+	// patching Spec.Paused=false when traffic arrives.
+	// Listener-level only: per-route configuration is NOT supported. Merge
+	// only lets an explicit true override the listener value, so a
+	// per-route false cannot disable wake enabled at the listener level.
+	EnableWakeOnTraffic bool `json:"enable-wake-on-traffic,omitempty"`
+	// WakeTimeoutSeconds is the max time (in seconds) to wait for a sandbox
+	// to resume before returning an error. Defaults to 60.
+	// Listener-level only: per-route configuration is NOT supported. Every
+	// parsed config carries the default 60, so any per-route config block
+	// would unintentionally reset a listener-level timeout.
+	WakeTimeoutSeconds int `json:"wake-timeout-seconds,omitempty"`
 }
 
 // DefaultConfig returns default configuration
@@ -74,14 +94,12 @@ func DefaultConfig() *Config {
 		HostHeaderName:           DefaultHostHeaderName,
 		DefaultPort:              DefaultSandboxPort,
 		TrafficAccessTokenHeader: DefaultTrafficAccessTokenHeader,
+		WakeTimeoutSeconds:       60,
 	}
 }
 
 // Validate checks configuration validity
 func (c *Config) Validate() error {
-	if c.EnableJWTAuth && !c.EnableAuth {
-		return fmt.Errorf("enable-jwt-auth requires enable-auth")
-	}
 	headerName := c.GetTrafficAccessTokenHeader()
 	if !httpguts.ValidHeaderFieldName(headerName) || strings.HasPrefix(headerName, ":") {
 		return fmt.Errorf("traffic-access-token-header %q is not a valid HTTP header name", headerName)
@@ -133,6 +151,14 @@ func (c *Config) GetTrafficAccessTokenHeader() string {
 		return strings.ToLower(c.TrafficAccessTokenHeader)
 	}
 	return DefaultTrafficAccessTokenHeader
+}
+
+// GetWakeTimeoutSeconds returns the wake timeout in seconds, defaulting to 60.
+func (c *Config) GetWakeTimeoutSeconds() int {
+	if c.WakeTimeoutSeconds > 0 {
+		return c.WakeTimeoutSeconds
+	}
+	return 60
 }
 
 // FilterConfig wraps Config and holds the adapter created from the config
@@ -276,6 +302,15 @@ func (p *ConfigParser) Merge(parent interface{}, child interface{}) interface{} 
 	}
 	if childCfg.trafficAccessTokenHeaderExplicit {
 		merged.TrafficAccessTokenHeader = childCfg.TrafficAccessTokenHeader
+	}
+	// Wake-on-traffic is listener-level configuration: per-route overrides
+	// are not supported. Only an explicit true / positive value propagates;
+	// a per-route config can neither disable wake nor reset the timeout.
+	if childCfg.EnableWakeOnTraffic {
+		merged.EnableWakeOnTraffic = childCfg.EnableWakeOnTraffic
+	}
+	if childCfg.WakeTimeoutSeconds > 0 {
+		merged.WakeTimeoutSeconds = childCfg.WakeTimeoutSeconds
 	}
 
 	jwtAuthManager := parentCfg.jwtAuthManager

@@ -116,12 +116,33 @@ wait_for_manager() {
 }
 
 wait_for_gateway() {
-    echo "Waiting for sandbox-gateway pods to be ready..."
-    kubectl wait --for=condition=ready pod \
-        -l app.kubernetes.io/name=sandbox-gateway \
-        -n sandbox-system \
-        --timeout=5m
-    echo "All sandbox-gateway pods are ready"
+    echo "Waiting for sandbox-gateway deployment to be ready..."
+    if kubectl rollout status deployment/sandbox-gateway \
+            -n sandbox-system --timeout=5m; then
+        echo "sandbox-gateway deployment is ready"
+        return 0
+    fi
+
+    echo "ERROR: sandbox-gateway deployment is not ready" >&2
+    echo "=== Deployment Status ==="
+    kubectl get deployment sandbox-gateway -n sandbox-system -o wide || true
+    echo "=== Pod Status ==="
+    kubectl get pod -l app.kubernetes.io/name=sandbox-gateway \
+        -n sandbox-system -o wide || true
+    echo "=== Pod Describe ==="
+    kubectl describe pod -l app.kubernetes.io/name=sandbox-gateway \
+        -n sandbox-system || true
+    echo "=== Pod Logs ==="
+    local pod
+    for pod in $(kubectl get pod -l app.kubernetes.io/name=sandbox-gateway \
+                    -n sandbox-system --no-headers \
+                    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+        echo "--- Logs for $pod (tail=200) ---"
+        kubectl logs "$pod" -n sandbox-system -c sandbox-gateway --tail=200 2>&1 || true
+        echo "--- Previous logs for $pod (tail=200) ---"
+        kubectl logs "$pod" -n sandbox-system -c sandbox-gateway --previous --tail=200 2>&1 || true
+    done
+    return 1
 }
 
 install_deps() {
@@ -416,6 +437,7 @@ if [[ "$WITH_GATEWAY" != "true" ]]; then
     pytest_args+=(--ignore="$TEST_DIR/test_gateway_auth.py")
     pytest_args+=(--ignore="$TEST_DIR/test_gateway_jwt_auth.py")
     pytest_args+=(--ignore="$TEST_DIR/test_gateway_runtime_mtls.py")
+    pytest_args+=(--ignore="$TEST_DIR/test_wake_on_traffic.py")
 elif [[ -z "$PYTEST_MARKER_EXPR" ]]; then
     # The default gateway deployment has authentication and Runtime mTLS disabled.
     pytest_args+=(-m "not gateway_uuid_auth and not jwt_auth and not runtime_mtls")
@@ -457,6 +479,17 @@ set -e
 
 if [ "$retVal" -ne 0 ]; then
     echo "Tests failed"
+
+    # Dump sandbox-gateway pod logs on failure for debugging wake-on-traffic
+    # and other gateway issues. The gateway runs Envoy + Go filter, and its
+    # logs are not captured otherwise.
+    if [ "$WITH_GATEWAY" = "true" ]; then
+        echo "=== sandbox-gateway pod logs (current) ==="
+        for gwPod in $(kubectl get pod -n sandbox-system -l app.kubernetes.io/name=sandbox-gateway --no-headers -o jsonpath='{.items[*].metadata.name}'); do
+            echo "--- Logs for gateway pod: $gwPod ---"
+            kubectl logs "$gwPod" -n sandbox-system --tail=500 2>&1 || echo "Failed to get logs for $gwPod"
+        done
+    fi
 else
     echo "All E2B tests passed successfully!"
 fi

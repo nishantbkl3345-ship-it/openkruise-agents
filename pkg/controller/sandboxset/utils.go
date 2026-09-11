@@ -18,6 +18,7 @@ package sandboxset
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"time"
 
@@ -88,47 +89,6 @@ func calculateSandboxSetStatusFromGroup(ctx context.Context, newStatus *agentsv1
 		"creating", len(groups.Creating), "dirtyCreating", len(dirtyScaleUp[expectations.Create]))
 }
 
-/* Just Reserved for SandboxAutoScaler
-func calculateExpectPoolSize(ctx context.Context, total, unused int32, sbs *agentsv1alpha1.SandboxSet) (int32, error) {
-	log := klog.FromContext(ctx).V(utils.DebugLogLevel)
-	if sbs.Spec.MaxReplicas == sbs.Spec.MinReplicas {
-		return sbs.Spec.MinReplicas, nil // optimize
-	}
-	actualWaterMark := int(total - unused)
-	highWaterMark, err := intstr.GetScaledValueFromIntOrPercent(sbs.Spec.HighWaterMark, int(total), false)
-	if err != nil {
-		return 0, err
-	}
-	lowWaterMark, err := intstr.GetScaledValueFromIntOrPercent(sbs.Spec.LowWaterMark, int(total), true)
-	if err != nil {
-		return 0, err
-	}
-	expectTotal := total
-	if actualWaterMark > highWaterMark {
-		// should scale up
-		expectScaleUp := int32(actualWaterMark - highWaterMark)
-		unusedAfterScaleUp := unused + expectScaleUp
-		actualScaleUp := expectScaleUp
-		if unusedAfterScaleUp > sbs.Spec.Replicas {
-			actualScaleUp = max(0, expectScaleUp-unusedAfterScaleUp-sbs.Spec.Replicas) // just in case
-		}
-		log.Info("actual scale up calculated", "actualScaleUp", actualScaleUp, "expectScaleUp", expectScaleUp,
-			"unusedAfterScaleUp", unusedAfterScaleUp, "maxUnused", sbs.Spec.Replicas, "highWaterMark", highWaterMark, "lowWaterMark", lowWaterMark)
-		expectTotal = total + actualScaleUp
-	}
-	if actualWaterMark < lowWaterMark {
-		// should scale down
-		expectTotal = total + int32(actualWaterMark-lowWaterMark)
-	}
-	// limit
-	expectTotal = min(expectTotal, sbs.Spec.MaxReplicas)
-	expectTotal = max(expectTotal, sbs.Spec.MinReplicas)
-	log.Info("expect pool size calculated", "expectTotal", expectTotal, "oldTotal", total,
-		"highWaterMark", highWaterMark, "lowWaterMark", lowWaterMark, "actualWaterMark", actualWaterMark)
-	return expectTotal, nil
-}
-*/
-
 func clearAndInitInnerKeys(m map[string]string) map[string]string {
 	if m == nil {
 		return map[string]string{}
@@ -178,14 +138,18 @@ func NewSandboxFromSandboxSet(sbs *agentsv1alpha1.SandboxSet, refTemplate *agent
 	// source pod template before reading labels/annotations so subsequent
 	// mutations (clearAndInitInnerKeys, internal label writes) never leak
 	// back into the SandboxSet spec or the cached SandboxTemplate.
+	// The metadata maps are cloned (not shared) so that the internal labels
+	// written below land only on the Sandbox metadata: if they shared the Pod
+	// template's maps, they would be persisted into spec.template and thus
+	// propagated onto every Pod created from it.
 	if sbs.Spec.Template != nil {
 		template = sbs.Spec.Template.DeepCopy()
-		inheritedLabels = template.Labels
-		inheritedAnnotations = template.Annotations
+		inheritedLabels = maps.Clone(template.Labels)
+		inheritedAnnotations = maps.Clone(template.Annotations)
 	} else if refTemplate != nil && refTemplate.Spec.Template != nil {
 		templateCopy := refTemplate.Spec.Template.DeepCopy()
-		inheritedLabels = templateCopy.Labels
-		inheritedAnnotations = templateCopy.Annotations
+		inheritedLabels = maps.Clone(templateCopy.Labels)
+		inheritedAnnotations = maps.Clone(templateCopy.Annotations)
 	}
 	sbx := &agentsv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
@@ -197,6 +161,9 @@ func NewSandboxFromSandboxSet(sbs *agentsv1alpha1.SandboxSet, refTemplate *agent
 		Spec: agentsv1alpha1.SandboxSpec{
 			PersistentContents: sbs.Spec.PersistentContents,
 			Runtimes:           sbs.Spec.Runtimes,
+			PauseStrategy:      sbs.Spec.PauseStrategy,
+			Probes:             sbs.Spec.Probes,
+			AutoPausePolicy:    sbs.Spec.AutoPausePolicy,
 			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
 				TemplateRef:          sbs.Spec.TemplateRef,
 				Template:             template,

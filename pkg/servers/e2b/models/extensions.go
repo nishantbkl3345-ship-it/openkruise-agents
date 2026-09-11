@@ -19,6 +19,7 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,6 +52,8 @@ const (
 	ExtensionKeyWaitReadyTimeout              = v1alpha1.E2BPrefix + "wait-ready-timeout-seconds"
 	ExtensionKeyClaimWithCPURequest           = v1alpha1.E2BPrefix + "cpu-request"
 	ExtensionKeyClaimWithCPULimit             = v1alpha1.E2BPrefix + "cpu-limit"
+	ExtensionKeyClaimWithMemoryRequest        = v1alpha1.E2BPrefix + "memory-request"
+	ExtensionKeyClaimWithMemoryLimit          = v1alpha1.E2BPrefix + "memory-limit"
 	ExtensionKeyClaimWithImage                = v1alpha1.E2BPrefix + "image"
 	ExtensionKeyClaimWithCSIMount             = v1alpha1.E2BPrefix + "csi"
 	ExtensionKeyClaimWithCSIMount_VolumeName  = ExtensionKeyClaimWithCSIMount + "-volume-name"
@@ -68,6 +71,9 @@ const (
 	MetadataKeySandboxResource                = v1alpha1.E2BPrefix + "sandbox-resource"
 	ExtensionKeySandboxName                   = v1alpha1.E2BPrefix + "sandbox-name"
 	ExtensionKeySandboxGenerateName           = v1alpha1.E2BPrefix + "sandbox-generate-name"
+	// ExtensionKeySecurityRules is the reserved metadata key carrying inline
+	// egress security rules as a JSON array of SecurityRule.
+	ExtensionKeySecurityRules = v1alpha1.MetadataKeySecurityRules
 )
 
 const (
@@ -103,7 +109,40 @@ func (r *NewSandboxRequest) ParseExtensions() error {
 	if err := r.parseExtensionCSIMount(); err != nil {
 		return err
 	}
+	// Parse the reserved inline security-rules key into structured rules.
+	// Validation and normalization happen in the e2b server layer before
+	// the sandbox is created.
+	if raw, ok := r.Metadata[ExtensionKeySecurityRules]; ok {
+		rules, err := parseInlineSecurityRules(raw)
+		if err != nil {
+			return err
+		}
+		r.Extensions.SecurityRules = rules
+		delete(r.Metadata, ExtensionKeySecurityRules)
+	}
 	return nil
+}
+
+// parseInlineSecurityRules decodes the reserved metadata value strictly:
+// unknown fields fail the request instead of being silently dropped, and the
+// value must be exactly one JSON array with nothing but whitespace after it.
+func parseInlineSecurityRules(raw string) ([]v1alpha1.SecurityRule, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("metadata key %q must not be empty: provide a security-rules JSON array or omit the key", ExtensionKeySecurityRules)
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var rules []v1alpha1.SecurityRule
+	if err := dec.Decode(&rules); err != nil {
+		return nil, fmt.Errorf("metadata %q is not a valid security-rules JSON array: %v", ExtensionKeySecurityRules, err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("metadata %q must contain exactly one security-rules JSON array value", ExtensionKeySecurityRules)
+	}
+	if len(rules) == 0 {
+		return nil, fmt.Errorf("metadata %q must contain at least one security rule", ExtensionKeySecurityRules)
+	}
+	return rules, nil
 }
 
 func (r *NewSandboxRequest) parseCommonExtensions() error {
@@ -243,31 +282,43 @@ func (r *NewSandboxRequest) parseExtensionImage() error {
 }
 
 func (r *NewSandboxRequest) parseExtensionResources() error {
-	cpuReq, hasCPUReq, err := r.parseAndRemoveQuantity(ExtensionKeyClaimWithCPURequest)
-	if err != nil {
-		return err
+	type resourceTarget int
+	const (
+		targetRequests resourceTarget = iota
+		targetLimits
+	)
+	resourceExtensions := []struct {
+		key          string
+		resourceName corev1.ResourceName
+		target       resourceTarget
+	}{
+		{key: ExtensionKeyClaimWithCPURequest, resourceName: corev1.ResourceCPU, target: targetRequests},
+		{key: ExtensionKeyClaimWithCPULimit, resourceName: corev1.ResourceCPU, target: targetLimits},
+		{key: ExtensionKeyClaimWithMemoryRequest, resourceName: corev1.ResourceMemory, target: targetRequests},
+		{key: ExtensionKeyClaimWithMemoryLimit, resourceName: corev1.ResourceMemory, target: targetLimits},
 	}
-	cpuLim, hasCPULim, err := r.parseAndRemoveQuantity(ExtensionKeyClaimWithCPULimit)
-	if err != nil {
-		return err
-	}
-	if !hasCPUReq && !hasCPULim {
-		return nil
-	}
-	if r.Extensions.InplaceUpdate.Resources == nil {
-		r.Extensions.InplaceUpdate.Resources = &InplaceUpdateResourcesExtension{}
-	}
-	if hasCPUReq {
-		if r.Extensions.InplaceUpdate.Resources.Requests == nil {
-			r.Extensions.InplaceUpdate.Resources.Requests = corev1.ResourceList{}
+	for _, extension := range resourceExtensions {
+		quantity, ok, err := r.parseAndRemoveQuantity(extension.key)
+		if err != nil {
+			return err
 		}
-		r.Extensions.InplaceUpdate.Resources.Requests[corev1.ResourceCPU] = cpuReq
-	}
-	if hasCPULim {
+		if !ok {
+			continue
+		}
+		if r.Extensions.InplaceUpdate.Resources == nil {
+			r.Extensions.InplaceUpdate.Resources = &InplaceUpdateResourcesExtension{}
+		}
+		if extension.target == targetRequests {
+			if r.Extensions.InplaceUpdate.Resources.Requests == nil {
+				r.Extensions.InplaceUpdate.Resources.Requests = corev1.ResourceList{}
+			}
+			r.Extensions.InplaceUpdate.Resources.Requests[extension.resourceName] = quantity
+			continue
+		}
 		if r.Extensions.InplaceUpdate.Resources.Limits == nil {
 			r.Extensions.InplaceUpdate.Resources.Limits = corev1.ResourceList{}
 		}
-		r.Extensions.InplaceUpdate.Resources.Limits[corev1.ResourceCPU] = cpuLim
+		r.Extensions.InplaceUpdate.Resources.Limits[extension.resourceName] = quantity
 	}
 	return nil
 }

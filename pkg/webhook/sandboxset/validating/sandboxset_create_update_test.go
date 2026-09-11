@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
@@ -35,14 +36,28 @@ import (
 	"github.com/openkruise/agents/api/v1alpha1"
 )
 
+// newExecProbe builds a minimal valid exec probe for the validation cases.
+func newExecProbe(name string, command ...string) v1alpha1.Probe {
+	return v1alpha1.Probe{
+		Name: name,
+		Probe: corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: command},
+			},
+		},
+	}
+}
+
 func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 	// Add v1alpha1 to scheme
 	err := v1alpha1.AddToScheme(scheme.Scheme)
 	require.NoError(t, err)
 
 	tests := []struct {
-		name         string
-		sandboxSet   *v1alpha1.SandboxSet
+		name       string
+		sandboxSet *v1alpha1.SandboxSet
+		// operation defaults to Create when empty.
+		operation    admissionv1.Operation
 		expectAllow  bool
 		expectError  bool
 		errorMessage string
@@ -501,8 +516,9 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 					},
 				},
 			},
-			expectAllow: true, // GetScaledValueFromIntOrPercent accepts negative integers (treats as 0)
-			expectError: false,
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "must be >= 0",
 		},
 		{
 			name: "Invalid MaxUnavailable - negative percentage",
@@ -523,8 +539,9 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 					},
 				},
 			},
-			expectAllow: true, // GetScaledValueFromIntOrPercent accepts negative percentages (treats as 0)
-			expectError: false,
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: `must be a percentage in the form "<number>%"`,
 		},
 		{
 			name: "Invalid MaxUnavailable - exceeds 100%",
@@ -545,8 +562,9 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 					},
 				},
 			},
-			expectAllow: true, // GetScaledValueFromIntOrPercent accepts values > 100%
-			expectError: false,
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "must be within [0%, 100%]",
 		},
 		{
 			name: "Invalid MaxUnavailable - invalid format (not a percentage)",
@@ -569,7 +587,7 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 			},
 			expectAllow:  false,
 			expectError:  true,
-			errorMessage: "maxUnavailable is invalid",
+			errorMessage: `must be a percentage in the form "<number>%"`,
 		},
 		{
 			name: "Invalid MaxUnavailable - invalid percentage format",
@@ -592,7 +610,7 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 			},
 			expectAllow:  false,
 			expectError:  true,
-			errorMessage: "maxUnavailable is invalid",
+			errorMessage: `must be a percentage in the form "<number>%"`,
 		},
 		{
 			name: "Valid UpdateStrategy.MaxUnavailable - percentage value",
@@ -659,7 +677,230 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 			},
 			expectAllow:  false,
 			expectError:  true,
-			errorMessage: "maxUnavailable is invalid",
+			errorMessage: `must be a percentage in the form "<number>%"`,
+		},
+		{
+			name: "Valid probes and autoPausePolicy",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{
+						newExecProbe("idle", "cat", "/tmp/idle"),
+						newExecProbe("schedule", "cat", "/tmp/schedule"),
+					},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Pause: &v1alpha1.PausePolicy{
+							WhenProbedIdleState: &v1alpha1.ProbedIdleStateRule{
+								Probe:             "idle",
+								MessageRegex:      "^idle$",
+								ThresholdDuration: &metav1.Duration{Duration: 5 * time.Minute},
+							},
+						},
+						Resume: &v1alpha1.ResumePolicy{
+							WhenProbedScheduleTime: &v1alpha1.ProbedScheduleTimeRule{
+								Probe:      "schedule",
+								TimeFormat: v1alpha1.ProbeTimeFormatUnix,
+								LeadTime:   &metav1.Duration{Duration: time.Minute},
+							},
+						},
+					},
+				},
+			},
+			expectAllow: true,
+			expectError: false,
+		},
+		{
+			name: "Valid ingress traffic autoPausePolicy without probes",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Resume: &v1alpha1.ResumePolicy{
+							OnIngressTraffic: &v1alpha1.IngressTrafficRule{},
+						},
+					},
+				},
+			},
+			expectAllow: true,
+			expectError: false,
+		},
+		{
+			name: "Invalid probe - duplicate name",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{
+						newExecProbe("idle", "cat", "/tmp/a"),
+						newExecProbe("idle", "cat", "/tmp/b"),
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "Duplicate value",
+		},
+		{
+			name: "Invalid probe - non-exec handler",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{
+						{
+							Name: "http",
+							Probe: corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "Unsupported value: \"httpGet\": supported values: \"exec\"",
+		},
+		{
+			name: "Invalid autoPausePolicy - pause rule references undefined probe",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{newExecProbe("idle", "cat", "/tmp/idle")},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Pause: &v1alpha1.PausePolicy{
+							WhenProbedIdleState: &v1alpha1.ProbedIdleStateRule{
+								Probe:             "missing",
+								MessageRegex:      "^idle$",
+								ThresholdDuration: &metav1.Duration{Duration: time.Minute},
+							},
+						},
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "must reference a probe name defined in spec.probes",
+		},
+		{
+			name: "Invalid autoPausePolicy - messageRegex does not compile",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{newExecProbe("idle", "cat", "/tmp/idle")},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Pause: &v1alpha1.PausePolicy{
+							WhenProbedIdleState: &v1alpha1.ProbedIdleStateRule{
+								Probe:             "idle",
+								MessageRegex:      "([a-z",
+								ThresholdDuration: &metav1.Duration{Duration: time.Minute},
+							},
+						},
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "error parsing regexp",
+		},
+		{
+			name: "Invalid autoPausePolicy - thresholdDuration missing",
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{newExecProbe("idle", "cat", "/tmp/idle")},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Pause: &v1alpha1.PausePolicy{
+							WhenProbedIdleState: &v1alpha1.ProbedIdleStateRule{
+								Probe:        "idle",
+								MessageRegex: "^idle$",
+							},
+						},
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "thresholdDuration is required",
+		},
+		{
+			// The webhook is registered for update as well, so a probe change that
+			// would have been rejected at create cannot slip in through an update.
+			name:      "Invalid probe on update - undefined probe reference",
+			operation: admissionv1.Update,
+			sandboxSet: &v1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sbs",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.SandboxSetSpec{
+					Replicas: 1,
+					EmbeddedSandboxTemplate: v1alpha1.EmbeddedSandboxTemplate{
+						TemplateRef: &v1alpha1.SandboxTemplateRef{Name: "test-template"},
+					},
+					Probes: []v1alpha1.Probe{newExecProbe("idle", "cat", "/tmp/idle")},
+					AutoPausePolicy: &v1alpha1.AutoPausePolicy{
+						Pause: &v1alpha1.PausePolicy{
+							WhenProbedIdleState: &v1alpha1.ProbedIdleStateRule{
+								Probe:             "renamed",
+								MessageRegex:      "^idle$",
+								ThresholdDuration: &metav1.Duration{Duration: time.Minute},
+							},
+						},
+					},
+				},
+			},
+			expectAllow:  false,
+			expectError:  true,
+			errorMessage: "must reference a probe name defined in spec.probes",
 		},
 	}
 
@@ -684,10 +925,17 @@ func TestSandboxSetValidatingHandler_Handle(t *testing.T) {
 			sbsRaw, err := json.Marshal(tt.sandboxSet)
 			require.NoError(t, err)
 
+			operation := tt.operation
+			if operation == "" {
+				operation = admissionv1.Create
+			}
 			req := admission.Request{
 				AdmissionRequest: admissionv1.AdmissionRequest{
-					Operation: admissionv1.Create,
+					Operation: operation,
 					Object: runtime.RawExtension{
+						Raw: sbsRaw,
+					},
+					OldObject: runtime.RawExtension{
 						Raw: sbsRaw,
 					},
 				},

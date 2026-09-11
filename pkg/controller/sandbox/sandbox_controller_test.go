@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +50,7 @@ import (
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
+	"github.com/openkruise/agents/pkg/utils/fieldindex"
 	"github.com/openkruise/agents/pkg/utils/timeout"
 )
 
@@ -67,6 +69,32 @@ func sandboxPatchSetsPaused(t *testing.T, patch client.Patch, obj client.Object)
 	var body sandboxPatchBody
 	require.NoError(t, json.Unmarshal(patchData, &body), "failed to parse sandbox patch")
 	return patchData, body.Spec != nil && body.Spec.Paused != nil && *body.Spec.Paused
+}
+
+func TestMaxPendingTimeout(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured time.Duration
+		expected   time.Duration
+	}{
+		{name: "negative is normalized to minimum", configured: -time.Second, expected: 15 * time.Second},
+		{name: "zero is normalized to minimum", configured: 0, expected: 15 * time.Second},
+		{name: "below minimum is normalized", configured: 10 * time.Second, expected: 15 * time.Second},
+		{name: "minimum is unchanged", configured: 15 * time.Second, expected: 15 * time.Second},
+		{name: "default is unchanged", configured: 50 * time.Second, expected: 50 * time.Second},
+		{name: "configured value is unchanged", configured: 120 * time.Second, expected: 120 * time.Second},
+		{name: "maximum is unchanged", configured: 3590 * time.Second, expected: 3590 * time.Second},
+		{name: "above maximum is capped", configured: 3600 * time.Second, expected: 3590 * time.Second},
+	}
+
+	original := maxPendingTimeout
+	defer func() { maxPendingTimeout = original }()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			maxPendingTimeout = tt.configured
+			assert.Equal(t, tt.expected, MaxPendingTimeout())
+		})
+	}
 }
 
 func TestAdd_FeatureGateDisabled(t *testing.T) {
@@ -758,7 +786,9 @@ func TestSandboxReconciler_Reconcile(t *testing.T) {
 				objects = append(objects, tt.pod)
 			}
 			fakeRecorder := record.NewFakeRecorder(100)
-			client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&agentsv1alpha1.Sandbox{}).WithObjects(objects...).Build()
+			client := fake.NewClientBuilder().WithScheme(scheme).
+				WithIndex(&agentsv1alpha1.Checkpoint{}, fieldindex.IndexNameForCheckpointSandboxName, fieldindex.CheckpointSandboxNameIndexFunc).
+				WithStatusSubresource(&agentsv1alpha1.Sandbox{}).WithObjects(objects...).Build()
 			rl := core.NewRateLimiter()
 			reconciler := &SandboxReconciler{
 				Client: client,
@@ -1376,26 +1406,206 @@ func TestSandboxReconciler_preparePausedPhase(t *testing.T) {
 		Status: metav1.ConditionFalse,
 		Reason: agentsv1alpha1.SandboxPausedReasonPending,
 	}
+	pausedWaitingForExistingCheckpoint := metav1.Condition{
+		Type:   string(agentsv1alpha1.SandboxConditionPaused),
+		Status: metav1.ConditionFalse,
+		Reason: agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint,
+	}
 	pausedCompleted := metav1.Condition{
 		Type:   string(agentsv1alpha1.SandboxConditionPaused),
 		Status: metav1.ConditionTrue,
 		Reason: agentsv1alpha1.SandboxPausedReasonStopPauseSucceed,
 	}
+	type additionalCheckpoint struct {
+		name  string
+		phase agentsv1alpha1.CheckpointPhase
+		age   time.Duration
+	}
 
 	tests := []struct {
-		name           string
-		finalizers     []string
-		conditions     []metav1.Condition
-		injectPatchErr bool
-		wantErr        bool
-		wantFinalizer  bool
-		wantPaused     metav1.Condition
-		wantReady      *metav1.Condition
+		name                            string
+		finalizers                      []string
+		conditions                      []metav1.Condition
+		checkpointPhase                 *agentsv1alpha1.CheckpointPhase
+		checkpointAge                   time.Duration
+		checkpointPodName               bool
+		checkpointDeleting              bool
+		checkpointZeroCreationTimestamp bool
+		additionalCheckpoints           []additionalCheckpoint
+		disableRecorder                 bool
+		injectPatchErr                  bool
+		injectListErr                   bool
+		wantErr                         bool
+		wantWait                        bool
+		wantEvent                       bool
+		wantFinalizer                   bool
+		wantPaused                      metav1.Condition
+		wantMessage                     string
+		wantReady                       *metav1.Condition
 	}{
 		{
 			name:          "initializes paused condition and adds finalizer",
 			wantFinalizer: true,
 			wantPaused:    pausedPending,
+		},
+		{
+			name:              "waits for recent pending checkpoint by pod name",
+			finalizers:        []string{core.SandboxFinalizer},
+			checkpointPhase:   ptr.To(agentsv1alpha1.CheckpointPending),
+			checkpointAge:     time.Minute,
+			checkpointPodName: true,
+			wantWait:          true,
+			wantEvent:         true,
+			wantFinalizer:     true,
+			wantPaused:        pausedWaitingForExistingCheckpoint,
+			wantMessage:       "Pause is waiting for existing checkpoint existing-checkpoint to complete (phase: Pending)",
+		},
+		{
+			name:            "waits for recent creating checkpoint by sandbox name",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointAge:   time.Minute,
+			wantWait:        true,
+			wantEvent:       true,
+			wantFinalizer:   true,
+			wantPaused:      pausedWaitingForExistingCheckpoint,
+			wantMessage:     "Pause is waiting for existing checkpoint existing-checkpoint to complete (phase: Creating)",
+		},
+		{
+			name:            "waits for checkpoint with empty phase",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointPhase("")),
+			checkpointAge:   time.Minute,
+			wantWait:        true,
+			wantEvent:       true,
+			wantFinalizer:   true,
+			wantPaused:      pausedWaitingForExistingCheckpoint,
+			wantMessage:     "Pause is waiting for existing checkpoint existing-checkpoint to complete (phase: <empty>)",
+		},
+		{
+			name:                            "waits when checkpoint creation timestamp is absent",
+			finalizers:                      []string{core.SandboxFinalizer},
+			checkpointPhase:                 ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointZeroCreationTimestamp: true,
+			wantWait:                        true,
+			wantEvent:                       true,
+			wantFinalizer:                   true,
+			wantPaused:                      pausedWaitingForExistingCheckpoint,
+			wantMessage:                     "Pause is waiting for existing checkpoint existing-checkpoint to complete (phase: Creating)",
+		},
+		{
+			name:            "waits without event recorder",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointPending),
+			checkpointAge:   time.Minute,
+			disableRecorder: true,
+			wantWait:        true,
+			wantFinalizer:   true,
+			wantPaused:      pausedWaitingForExistingCheckpoint,
+			wantMessage:     "Pause is waiting for existing checkpoint existing-checkpoint to complete (phase: Pending)",
+		},
+		{
+			name:            "selects newest active checkpoint deterministically",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointAge:   2 * time.Minute,
+			additionalCheckpoints: []additionalCheckpoint{
+				{name: "newer-checkpoint", phase: agentsv1alpha1.CheckpointPending, age: time.Minute},
+			},
+			wantWait:      true,
+			wantEvent:     true,
+			wantFinalizer: true,
+			wantPaused:    pausedWaitingForExistingCheckpoint,
+			wantMessage:   "Pause is waiting for existing checkpoint newer-checkpoint to complete (phase: Pending)",
+		},
+		{
+			name:            "uses checkpoint name to break creation timestamp ties",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointAge:   time.Minute,
+			additionalCheckpoints: []additionalCheckpoint{
+				{name: "a-checkpoint", phase: agentsv1alpha1.CheckpointPending, age: time.Minute},
+			},
+			wantWait:      true,
+			wantEvent:     true,
+			wantFinalizer: true,
+			wantPaused:    pausedWaitingForExistingCheckpoint,
+			wantMessage:   "Pause is waiting for existing checkpoint a-checkpoint to complete (phase: Pending)",
+		},
+		{
+			name:            "ignores creating checkpoint older than timeout",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointAge:   checkpointCreationWaitTimeout + time.Second,
+			wantFinalizer:   true,
+			wantPaused:      pausedPending,
+		},
+		{
+			name:               "ignores deleting checkpoint",
+			finalizers:         []string{core.SandboxFinalizer},
+			checkpointPhase:    ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointAge:      time.Minute,
+			checkpointDeleting: true,
+			wantFinalizer:      true,
+			wantPaused:         pausedPending,
+		},
+		{
+			name:            "ignores succeeded checkpoint",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointSucceeded),
+			checkpointAge:   time.Minute,
+			wantFinalizer:   true,
+			wantPaused:      pausedPending,
+		},
+		{
+			name:            "ignores failed checkpoint",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointFailed),
+			checkpointAge:   time.Minute,
+			wantFinalizer:   true,
+			wantPaused:      pausedPending,
+		},
+		{
+			name:            "ignores terminating checkpoint",
+			finalizers:      []string{core.SandboxFinalizer},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointTerminating),
+			checkpointAge:   time.Minute,
+			wantFinalizer:   true,
+			wantPaused:      pausedPending,
+		},
+		{
+			name:       "clears temporary checkpoint wait message when gate clears",
+			finalizers: []string{core.SandboxFinalizer},
+			conditions: []metav1.Condition{{
+				Type:    string(agentsv1alpha1.SandboxConditionPaused),
+				Status:  metav1.ConditionFalse,
+				Reason:  agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint,
+				Message: "Pause is waiting for existing checkpoint old-checkpoint to complete (phase: Creating)",
+			}},
+			wantFinalizer: true,
+			wantPaused:    pausedPending,
+		},
+		{
+			name:       "does not gate checkpoint already managed by pause control",
+			finalizers: []string{core.SandboxFinalizer},
+			conditions: []metav1.Condition{{
+				Type:   string(agentsv1alpha1.SandboxConditionPaused),
+				Status: metav1.ConditionFalse,
+				Reason: agentsv1alpha1.SandboxPausedReasonCheckpointCreating,
+			}},
+			checkpointPhase: ptr.To(agentsv1alpha1.CheckpointCreating),
+			checkpointAge:   time.Minute,
+			wantFinalizer:   true,
+			wantPaused: metav1.Condition{
+				Status: metav1.ConditionFalse,
+				Reason: agentsv1alpha1.SandboxPausedReasonCheckpointCreating,
+			},
+		},
+		{
+			name:          "checkpoint list error propagates with sandbox context",
+			finalizers:    []string{core.SandboxFinalizer},
+			injectListErr: true,
+			wantErr:       true,
 		},
 		{
 			name:       "existing finalizer skips patch and flips ready to false",
@@ -1457,29 +1667,96 @@ func TestSandboxReconciler_preparePausedPhase(t *testing.T) {
 					Conditions: tt.conditions,
 				},
 			}
-			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(box)
-			if tt.injectPatchErr {
-				builder = builder.WithInterceptorFuncs(interceptor.Funcs{
-					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-						return fmt.Errorf("injected patch failure")
+			testObjects := []client.Object{box}
+			if tt.checkpointPhase != nil {
+				checkpointCreationTimestamp := metav1.NewTime(time.Now().Add(-tt.checkpointAge))
+				checkpoint := &agentsv1alpha1.Checkpoint{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "existing-checkpoint",
+						Namespace: box.Namespace,
 					},
-				})
+					Status: agentsv1alpha1.CheckpointStatus{Phase: *tt.checkpointPhase},
+				}
+				if !tt.checkpointZeroCreationTimestamp {
+					checkpoint.CreationTimestamp = checkpointCreationTimestamp
+				}
+				if tt.checkpointDeleting {
+					checkpoint.DeletionTimestamp = ptr.To(metav1.Now())
+					checkpoint.Finalizers = []string{"test-finalizer"}
+				}
+				if tt.checkpointPodName {
+					checkpoint.Spec.PodName = &box.Name
+				} else {
+					checkpoint.Spec.SandboxName = &box.Name
+				}
+				testObjects = append(testObjects, checkpoint)
+				for _, additional := range tt.additionalCheckpoints {
+					creationTimestamp := metav1.NewTime(time.Now().Add(-additional.age))
+					if additional.age == tt.checkpointAge {
+						creationTimestamp = checkpointCreationTimestamp
+					}
+					testObjects = append(testObjects, &agentsv1alpha1.Checkpoint{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              additional.name,
+							Namespace:         box.Namespace,
+							CreationTimestamp: creationTimestamp,
+						},
+						Spec:   agentsv1alpha1.CheckpointSpec{SandboxName: &box.Name},
+						Status: agentsv1alpha1.CheckpointStatus{Phase: additional.phase},
+					})
+				}
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme).
+				WithIndex(&agentsv1alpha1.Checkpoint{}, fieldindex.IndexNameForCheckpointSandboxName, fieldindex.CheckpointSandboxNameIndexFunc).
+				WithObjects(testObjects...)
+			interceptorFuncs := interceptor.Funcs{}
+			if tt.injectPatchErr {
+				interceptorFuncs.Patch = func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					return fmt.Errorf("injected patch failure")
+				}
+			}
+			if tt.injectListErr {
+				interceptorFuncs.List = func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					return fmt.Errorf("injected list failure")
+				}
+			}
+			if tt.injectPatchErr || tt.injectListErr {
+				builder = builder.WithInterceptorFuncs(interceptorFuncs)
 			}
 			fakeClient := builder.Build()
-			reconciler := &SandboxReconciler{Client: fakeClient}
+			recorder := record.NewFakeRecorder(10)
+			reconciler := &SandboxReconciler{Client: fakeClient, recorder: recorder}
+			if tt.disableRecorder {
+				reconciler.recorder = nil
+			}
 
 			newStatus := box.Status.DeepCopy()
-			err := reconciler.preparePausedPhase(context.Background(), core.EnsureFuncArgs{Box: box, NewStatus: newStatus})
+			wait, err := reconciler.preparePausedPhase(context.Background(), core.EnsureFuncArgs{Box: box, NewStatus: newStatus})
 			if tt.wantErr {
 				require.Error(t, err)
+				if tt.injectListErr {
+					assert.ErrorContains(t, err, "failed to list checkpoints for sandbox default/paused-sandbox")
+					assert.ErrorContains(t, err, "injected list failure")
+				}
 				return
 			}
 			require.NoError(t, err)
+			assert.Equal(t, tt.wantWait, wait)
 
 			paused := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionPaused))
 			require.NotNil(t, paused)
 			assert.Equal(t, tt.wantPaused.Status, paused.Status)
 			assert.Equal(t, tt.wantPaused.Reason, paused.Reason)
+			assert.Equal(t, tt.wantMessage, paused.Message)
+			if tt.wantEvent {
+				assertSandboxRecorderEvent(t, recorder, corev1.EventTypeNormal+" "+agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint, paused.Message)
+				wait, err = reconciler.preparePausedPhase(context.Background(), core.EnsureFuncArgs{Box: box, NewStatus: newStatus})
+				require.NoError(t, err)
+				assert.True(t, wait)
+				assertNoSandboxRecorderEvent(t, recorder)
+			} else {
+				assertNoSandboxRecorderEvent(t, recorder)
+			}
 
 			if tt.wantReady != nil {
 				ready := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionReady))
@@ -1497,10 +1774,129 @@ func TestSandboxReconciler_preparePausedPhase(t *testing.T) {
 	}
 }
 
+func TestSandboxReconciler_ReconcileWaitsForInProgressCheckpoint(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, agentsv1alpha1.AddToScheme(scheme))
+
+	tests := []struct {
+		name          string
+		shutdownAfter *time.Duration
+	}{
+		{
+			name: "requeues after checkpoint polling interval without another timer",
+		},
+		{
+			name:          "checkpoint polling interval wins over later timer",
+			shutdownAfter: ptr.To(time.Minute),
+		},
+		{
+			name:          "earlier timer wins over checkpoint polling interval",
+			shutdownAfter: ptr.To(2 * time.Second),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			box := &agentsv1alpha1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "paused-sandbox",
+					Namespace:  "default",
+					Finalizers: []string{core.SandboxFinalizer},
+				},
+				Spec: agentsv1alpha1.SandboxSpec{
+					Paused: true,
+					EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+						Template: &corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "busybox"}}},
+						},
+					},
+				},
+				Status: agentsv1alpha1.SandboxStatus{
+					Phase: agentsv1alpha1.SandboxPaused,
+					Conditions: []metav1.Condition{
+						{
+							Type:   string(agentsv1alpha1.SandboxConditionPaused),
+							Status: metav1.ConditionFalse,
+							Reason: agentsv1alpha1.SandboxPausedReasonPending,
+						},
+						{
+							Type:   string(agentsv1alpha1.SandboxConditionReady),
+							Status: metav1.ConditionTrue,
+							Reason: "SandboxReady",
+						},
+					},
+				},
+			}
+			if tt.shutdownAfter != nil {
+				box.Spec.ShutdownTime = ptr.To(metav1.NewTime(time.Now().Add(*tt.shutdownAfter)))
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: box.Name, Namespace: box.Namespace},
+				Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			}
+			checkpoint := &agentsv1alpha1.Checkpoint{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "existing-checkpoint",
+					Namespace:         box.Namespace,
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
+				},
+				Spec: agentsv1alpha1.CheckpointSpec{PodName: &box.Name},
+				Status: agentsv1alpha1.CheckpointStatus{
+					Phase: agentsv1alpha1.CheckpointCreating,
+				},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&agentsv1alpha1.Sandbox{}).
+				WithIndex(&agentsv1alpha1.Checkpoint{}, fieldindex.IndexNameForCheckpointSandboxName, fieldindex.CheckpointSandboxNameIndexFunc).
+				WithObjects(box, pod, checkpoint).
+				Build()
+			recorder := record.NewFakeRecorder(10)
+			reconciler := &SandboxReconciler{
+				Client:   fakeClient,
+				Scheme:   scheme,
+				recorder: recorder,
+				// A nil control map makes this test fail immediately if the checkpoint
+				// gate accidentally delegates to EnsureSandboxPaused.
+				controls: nil,
+			}
+
+			startedAt := time.Now()
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Namespace: box.Namespace, Name: box.Name},
+			})
+			require.NoError(t, err)
+			if tt.shutdownAfter == nil || *tt.shutdownAfter > checkpointWaitRequeueInterval {
+				assert.Equal(t, checkpointWaitRequeueInterval, result.RequeueAfter)
+			} else {
+				assert.Positive(t, result.RequeueAfter)
+				assert.LessOrEqual(t, result.RequeueAfter, *tt.shutdownAfter)
+				assert.GreaterOrEqual(t, result.RequeueAfter, *tt.shutdownAfter-time.Since(startedAt)-time.Second)
+			}
+
+			updatedBox := &agentsv1alpha1.Sandbox{}
+			require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKeyFromObject(box), updatedBox))
+			paused := utils.GetSandboxCondition(&updatedBox.Status, string(agentsv1alpha1.SandboxConditionPaused))
+			require.NotNil(t, paused)
+			assert.Equal(t, metav1.ConditionFalse, paused.Status)
+			assert.Equal(t, agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint, paused.Reason)
+			assert.Equal(t, "Pause is waiting for existing checkpoint existing-checkpoint to complete (phase: Creating)", paused.Message)
+			ready := utils.GetSandboxCondition(&updatedBox.Status, string(agentsv1alpha1.SandboxConditionReady))
+			require.NotNil(t, ready)
+			assert.Equal(t, metav1.ConditionFalse, ready.Status)
+
+			remainingPod := &corev1.Pod{}
+			require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKeyFromObject(pod), remainingPod))
+			assertSandboxRecorderEvent(t, recorder, corev1.EventTypeNormal+" "+agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint, paused.Message)
+			assertNoSandboxRecorderEvent(t, recorder)
+		})
+	}
+}
+
 // TestSandboxReconciler_finalizeResumePhase verifies the common resume
-// finalization: the Paused condition is dropped from the status while other
-// conditions are preserved, and the pause finalizer is removed from the
-// sandbox when present.
+// finalization: the Paused condition and the stale probe state left by the
+// deleted pod are dropped from the status while other conditions are
+// preserved, and the pause finalizer is removed from the sandbox when present.
 func TestSandboxReconciler_finalizeResumePhase(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
@@ -1532,6 +1928,10 @@ func TestSandboxReconciler_finalizeResumePhase(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(box).Build()
 			reconciler := &SandboxReconciler{Client: fakeClient}
 
+			// The probe conditions and schedules carry pre-pause values: the
+			// idle message and the elapsed timestamps would re-pause the sandbox
+			// immediately unless the resume clears them.
+			stale := metav1.NewTime(time.Now().Add(-time.Hour))
 			newStatus := &agentsv1alpha1.SandboxStatus{
 				Phase: agentsv1alpha1.SandboxResuming,
 				Conditions: []metav1.Condition{
@@ -1547,6 +1947,24 @@ func TestSandboxReconciler_finalizeResumePhase(t *testing.T) {
 						Reason:             agentsv1alpha1.SandboxResumeReasonResumePod,
 						LastTransitionTime: metav1.Now(),
 					},
+					{
+						Type:               agentsv1alpha1.ProbeConditionPrefix + "Active",
+						Status:             metav1.ConditionTrue,
+						Reason:             agentsv1alpha1.ProbeReasonSucceeded,
+						Message:            "inactive",
+						LastTransitionTime: stale,
+					},
+					{
+						Type:               agentsv1alpha1.ProbeConditionPrefix + "Cron",
+						Status:             metav1.ConditionTrue,
+						Reason:             agentsv1alpha1.ProbeReasonSucceeded,
+						Message:            "1787926485",
+						LastTransitionTime: stale,
+					},
+				},
+				Schedules: []agentsv1alpha1.Schedule{
+					{Reason: agentsv1alpha1.ScheduleReasonProbedIdle, NextPauseTime: &stale},
+					{Reason: agentsv1alpha1.ScheduleReasonProbedSchedule, NextResumeTime: &stale},
 				},
 			}
 
@@ -1554,6 +1972,16 @@ func TestSandboxReconciler_finalizeResumePhase(t *testing.T) {
 
 			assert.Nil(t, utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionPaused)), "expected Paused condition to be removed")
 			assert.NotNil(t, utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionResumed)), "expected Resumed condition to be preserved")
+			assert.Nil(t, utils.GetSandboxCondition(newStatus, agentsv1alpha1.ProbeConditionPrefix+"Active"), "expected stale Active probe condition to be removed")
+			assert.Nil(t, utils.GetSandboxCondition(newStatus, agentsv1alpha1.ProbeConditionPrefix+"Cron"), "expected stale Cron probe condition to be removed")
+			// The entries have to survive so the status patch still carries the
+			// schedules field: an emptied slice is omitted by omitempty and JSON
+			// Merge Patch would leave the stale times in etcd.
+			require.Len(t, newStatus.Schedules, 2, "expected probe-driven schedule entries to be preserved")
+			for _, sched := range newStatus.Schedules {
+				assert.Nil(t, sched.NextPauseTime, "expected stale pause time to be cleared for %q", sched.Reason)
+				assert.Nil(t, sched.NextResumeTime, "expected stale resume time to be cleared for %q", sched.Reason)
+			}
 
 			updated := &agentsv1alpha1.Sandbox{}
 			require.NoError(t, fakeClient.Get(context.Background(), types.NamespacedName{Namespace: box.Namespace, Name: box.Name}, updated))
@@ -1642,29 +2070,72 @@ func TestSandboxReconciler_CheckTimers(t *testing.T) {
 	tests := []struct {
 		name          string
 		reuseReason   string
+		phase         agentsv1alpha1.SandboxPhase
+		shutdownTime  *metav1.Time
+		autoPause     bool
+		resumeOnly    bool
+		gateEnabled   bool
 		expectDone    bool
 		expectDeleted bool
+		expectPatch   int
 	}{
 		{
-			name:        "reuse in progress skips expired pause and shutdown timers",
-			reuseReason: agentsv1alpha1.SandboxRecyclingReasonStarted,
+			name:         "reuse in progress skips expired pause and shutdown timers",
+			reuseReason:  agentsv1alpha1.SandboxRecyclingReasonStarted,
+			phase:        agentsv1alpha1.SandboxRecycling,
+			shutdownTime: &past,
 		},
 		{
 			name:          "reuse failed allows expired shutdown deletion",
 			reuseReason:   agentsv1alpha1.SandboxRecyclingReasonFailed,
+			phase:         agentsv1alpha1.SandboxRecycling,
+			shutdownTime:  &past,
 			expectDone:    true,
 			expectDeleted: true,
 		},
 		{
 			name:          "reuse timeout allows expired shutdown deletion",
 			reuseReason:   agentsv1alpha1.SandboxRecyclingReasonTimeout,
+			phase:         agentsv1alpha1.SandboxRecycling,
+			shutdownTime:  &past,
 			expectDone:    true,
 			expectDeleted: true,
+		},
+		{
+			// PauseTime and an AutoPausePolicy pause rule both stay in force, so the
+			// one-shot deadline its owner asked for is still honoured. Whichever comes
+			// due first pauses the sandbox.
+			name:        "active auto-pause policy keeps the expired PauseTime timer",
+			phase:       agentsv1alpha1.SandboxRunning,
+			autoPause:   true,
+			gateEnabled: true,
+			expectDone:  true,
+			expectPatch: 1,
+		},
+		{
+			// With the gate off handleAutoPause never runs at all, so PauseTime is
+			// the only thing left that can pause the sandbox.
+			name:        "auto-pause gate disabled keeps the PauseTime timer",
+			phase:       agentsv1alpha1.SandboxRunning,
+			autoPause:   true,
+			expectDone:  true,
+			expectPatch: 1,
+		},
+		{
+			// Nothing in a resume-only policy ever pauses, so PauseTime carries the
+			// pause decision on its own here.
+			name:        "resume-only auto-pause policy keeps the PauseTime timer",
+			phase:       agentsv1alpha1.SandboxRunning,
+			resumeOnly:  true,
+			gateEnabled: true,
+			expectDone:  true,
+			expectPatch: 1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AutoPauseControllerGate, tt.gateEnabled)
 			box := &agentsv1alpha1.Sandbox{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "reuse-timer-sandbox",
@@ -1673,18 +2144,34 @@ func TestSandboxReconciler_CheckTimers(t *testing.T) {
 				},
 				Spec: agentsv1alpha1.SandboxSpec{
 					PauseTime:    &past,
-					ShutdownTime: &past,
+					ShutdownTime: tt.shutdownTime,
 				},
 				Status: agentsv1alpha1.SandboxStatus{
-					Phase: agentsv1alpha1.SandboxRecycling,
-					Conditions: []metav1.Condition{
-						{
-							Type:   string(agentsv1alpha1.SandboxConditionRecycling),
-							Status: metav1.ConditionFalse,
-							Reason: tt.reuseReason,
-						},
-					},
+					Phase: tt.phase,
 				},
+			}
+			if tt.reuseReason != "" {
+				box.Status.Conditions = []metav1.Condition{
+					{
+						Type:   string(agentsv1alpha1.SandboxConditionRecycling),
+						Status: metav1.ConditionFalse,
+						Reason: tt.reuseReason,
+					},
+				}
+			}
+			if tt.autoPause {
+				box.Spec.AutoPausePolicy = &agentsv1alpha1.AutoPausePolicy{
+					Pause: &agentsv1alpha1.PausePolicy{
+						WhenProbedIdleState: &agentsv1alpha1.ProbedIdleStateRule{Probe: "activity"},
+					},
+				}
+			}
+			if tt.resumeOnly {
+				box.Spec.AutoPausePolicy = &agentsv1alpha1.AutoPausePolicy{
+					Resume: &agentsv1alpha1.ResumePolicy{
+						WhenProbedScheduleTime: &agentsv1alpha1.ProbedScheduleTimeRule{Probe: "resume"},
+					},
+				}
 			}
 
 			deleteCalls := 0
@@ -1715,7 +2202,7 @@ func TestSandboxReconciler_CheckTimers(t *testing.T) {
 			} else {
 				assert.Equal(t, 0, deleteCalls)
 			}
-			assert.Equal(t, 0, patchCalls)
+			assert.Equal(t, tt.expectPatch, patchCalls)
 		})
 	}
 }
@@ -1736,6 +2223,8 @@ func TestSandboxReconciler_HandleShutdownTimeout(t *testing.T) {
 		shutdownTime  *metav1.Time
 		pauseTime     *metav1.Time
 		paused        bool
+		autoPause     bool
+		gateEnabled   bool
 		annotations   map[string]string
 		deletingAt    *metav1.Time
 		expectDone    bool
@@ -1749,8 +2238,10 @@ func TestSandboxReconciler_HandleShutdownTimeout(t *testing.T) {
 			shutdownTime: &future,
 		},
 		{
-			name:         "exact shutdown time skips handling",
-			shutdownTime: &exact,
+			name:          "exact shutdown time deletes",
+			shutdownTime:  &exact,
+			expectDone:    true,
+			expectDeleted: true,
 		},
 		{
 			name:          "past shutdown time without annotation deletes",
@@ -1801,10 +2292,93 @@ func TestSandboxReconciler_HandleShutdownTimeout(t *testing.T) {
 			expectDone:    true,
 			expectDeleted: true,
 		},
+		{
+			// The deferral opens only for a pause that is already due. An active
+			// auto-pause policy does not change that: PauseTime is still enforced
+			// alongside it, and this one is not due yet.
+			name:         "past shutdown time with annotation and active auto-pause policy deletes",
+			shutdownTime: &past,
+			pauseTime:    &future,
+			annotations: map[string]string{
+				agentsv1alpha1.AnnotationReservePausedSandboxDuration: timeout.ReservePausedSandboxDurationForeverValue,
+			},
+			autoPause:     true,
+			gateEnabled:   true,
+			expectDone:    true,
+			expectDeleted: true,
+		},
+		{
+			// A due PauseTime runs in this same reconcile even with an active policy,
+			// so the deferral stays bounded and the pause gets its chance to extend
+			// ShutdownTime by the retention window.
+			name:         "past shutdown time with annotation, active auto-pause policy and due pause time lets pause run",
+			shutdownTime: &past,
+			pauseTime:    &exact,
+			annotations: map[string]string{
+				agentsv1alpha1.AnnotationReservePausedSandboxDuration: timeout.ReservePausedSandboxDurationForeverValue,
+			},
+			autoPause:   true,
+			gateEnabled: true,
+		},
+		{
+			// A nil PauseTime means ShutdownTime is the caller's own hard lifetime
+			// bound rather than a value derived from an upcoming pause. Deferring to
+			// the idle probe here would be unbounded: a sandbox the probe never
+			// reports idle would outlive the timeout its owner asked for.
+			name:         "past shutdown time with annotation, auto-pause policy and nil pause time deletes",
+			shutdownTime: &past,
+			annotations: map[string]string{
+				agentsv1alpha1.AnnotationReservePausedSandboxDuration: timeout.ReservePausedSandboxDurationForeverValue,
+			},
+			autoPause:     true,
+			gateEnabled:   true,
+			expectDone:    true,
+			expectDeleted: true,
+		},
+		{
+			// With the gate off handleAutoPause never runs, so there is no probe
+			// decision to wait for and no future pause to extend ShutdownTime.
+			name:         "past shutdown time with auto-pause policy but gate disabled deletes",
+			shutdownTime: &past,
+			pauseTime:    &future,
+			annotations: map[string]string{
+				agentsv1alpha1.AnnotationReservePausedSandboxDuration: timeout.ReservePausedSandboxDurationForeverValue,
+			},
+			autoPause:     true,
+			expectDone:    true,
+			expectDeleted: true,
+		},
+		{
+			// The deferral is bounded by the annotation: without it there is no
+			// retention window to protect, so an expired ShutdownTime still deletes.
+			name:          "past shutdown time with active auto-pause policy but no annotation deletes",
+			shutdownTime:  &past,
+			pauseTime:     &future,
+			autoPause:     true,
+			gateEnabled:   true,
+			expectDone:    true,
+			expectDeleted: true,
+		},
+		{
+			// Once paused, auto-pause has already extended ShutdownTime by the
+			// retention duration, so an expired one means the window really elapsed.
+			name:         "past shutdown time with annotation, auto-pause policy and paused sandbox deletes",
+			shutdownTime: &past,
+			pauseTime:    &future,
+			paused:       true,
+			autoPause:    true,
+			gateEnabled:  true,
+			annotations: map[string]string{
+				agentsv1alpha1.AnnotationReservePausedSandboxDuration: timeout.ReservePausedSandboxDurationForeverValue,
+			},
+			expectDone:    true,
+			expectDeleted: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AutoPauseControllerGate, tt.gateEnabled)
 			deleteCalls := 0
 			cli := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
 				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
@@ -1825,6 +2399,13 @@ func TestSandboxReconciler_HandleShutdownTimeout(t *testing.T) {
 					PauseTime:    tt.pauseTime,
 					ShutdownTime: tt.shutdownTime,
 				},
+			}
+			if tt.autoPause {
+				box.Spec.AutoPausePolicy = &agentsv1alpha1.AutoPausePolicy{
+					Pause: &agentsv1alpha1.PausePolicy{
+						WhenProbedIdleState: &agentsv1alpha1.ProbedIdleStateRule{Probe: "activity"},
+					},
+				}
 			}
 
 			done, err := reconciler.handleShutdownTimeout(context.Background(), box, now)

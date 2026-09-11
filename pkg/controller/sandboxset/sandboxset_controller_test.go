@@ -329,6 +329,42 @@ func TestReconcile_DeleteDead(t *testing.T) {
 	}
 }
 
+func TestReconcile_SkipWhenDeleting(t *testing.T) {
+	utestutils.InitLogOutput()
+	ctx := context.Background()
+	k8sClient := NewClient()
+
+	sbs := getSandboxSet(2)
+	sbs.Finalizers = []string{"kruise.test/finalizer"}
+	assert.NoError(t, k8sClient.Create(ctx, sbs))
+	assert.NoError(t, k8sClient.Delete(ctx, sbs))
+
+	got := &v1alpha1.SandboxSet{}
+	assert.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(sbs), got))
+	require.NotNil(t, got.DeletionTimestamp)
+
+	eventRecorder := record.NewFakeRecorder(10)
+	reconciler := &Reconciler{
+		Client:   k8sClient,
+		Scheme:   testScheme,
+		Recorder: eventRecorder,
+		Codec:    serializer.NewCodecFactory(testScheme).LegacyCodec(v1alpha1.SchemeGroupVersion),
+	}
+
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(sbs)})
+	assert.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+
+	var sandboxList v1alpha1.SandboxList
+	assert.NoError(t, k8sClient.List(ctx, &sandboxList))
+	assert.Empty(t, sandboxList.Items)
+
+	assert.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(sbs), got))
+	assert.Empty(t, got.Status.UpdateRevision)
+	assert.Zero(t, got.Status.Replicas)
+	CheckAllEvents(t, eventRecorder, nil)
+}
+
 func TestReconcile_BasicScale(t *testing.T) {
 	utestutils.InitLogOutput()
 	checkFunc := func(totCnt, newCnt int) func(t *testing.T, client client.Client, sbs *v1alpha1.SandboxSet) {
@@ -565,6 +601,8 @@ func TestReconcile_BasicScale(t *testing.T) {
 			k8sClient := NewClient()
 
 			sbs := getSandboxSet(tt.replicas)
+			maxUnavailable := intstrutil.FromString("100%")
+			sbs.Spec.ScaleStrategy.MaxUnavailable = &maxUnavailable
 			assert.NoError(t, k8sClient.Create(ctx, sbs))
 
 			eventRecorder := record.NewFakeRecorder(10)
@@ -778,7 +816,7 @@ func TestReconcile_ScaleDown_RecycledFirst(t *testing.T) {
 	assert.Equal(t, "fresh-0", sandboxes.Items[0].Name, "recycled sandbox should be deleted first, fresh one kept")
 }
 
-func TestReconcile_ScaleDown_Priority(t *testing.T) {
+func testReconcileScaleDownPriorityHelper(t *testing.T, useUpdatedHash bool) {
 	utestutils.InitLogOutput()
 	ctx := context.Background()
 	k8sClient := NewClient()
@@ -794,8 +832,15 @@ func TestReconcile_ScaleDown_Priority(t *testing.T) {
 
 	spec, err := reconciler.buildSandboxTemplateSpec(ctx, sbs)
 	require.NoError(t, err)
-	hash, err := computeRevisionHash(spec)
+	updatedHash, err := computeRevisionHash(spec)
 	require.NoError(t, err)
+
+	var hash string
+	if useUpdatedHash {
+		hash = updatedHash
+	} else {
+		hash = "old-hash"
+	}
 
 	ownerRef := []metav1.OwnerReference{*metav1.NewControllerRef(sbs, v1alpha1.SandboxSetControllerKind)}
 
@@ -852,6 +897,14 @@ func TestReconcile_ScaleDown_Priority(t *testing.T) {
 	assert.Equal(t, "fresh-0", sandboxes.Items[0].Name, "pending, recycled, and not-ready should be deleted; fresh available kept")
 }
 
+func TestReconcile_ScaleDown_Priority(t *testing.T) {
+	testReconcileScaleDownPriorityHelper(t, true)
+}
+
+func TestReconcile_ScaleDown_OldCandidates_Priority(t *testing.T) {
+	testReconcileScaleDownPriorityHelper(t, false)
+}
+
 func TestCompareScaleDownPriority(t *testing.T) {
 	makeSandbox := func(phase v1alpha1.SandboxPhase, ready bool, recycledCount int32) *v1alpha1.Sandbox {
 		readyStatus := metav1.ConditionFalse
@@ -860,7 +913,7 @@ func TestCompareScaleDownPriority(t *testing.T) {
 		}
 		return &v1alpha1.Sandbox{
 			Status: v1alpha1.SandboxStatus{
-				Phase:        phase,
+				Phase:         phase,
 				RecycledCount: recycledCount,
 				Conditions: []metav1.Condition{
 					{Type: string(v1alpha1.SandboxConditionReady), Status: readyStatus},
@@ -941,6 +994,8 @@ func TestSandboxSetReconcile_WithVolumeClaimTemplates(t *testing.T) {
 			name: "sandboxset with volume claim templates creates sandboxes with PVC templates",
 			getSandboxSet: func() *v1alpha1.SandboxSet {
 				sbs := getSandboxSet(2)
+				maxUnavailable := intstrutil.FromString("100%")
+				sbs.Spec.ScaleStrategy.MaxUnavailable = &maxUnavailable
 				sbs.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
 					{
 						ObjectMeta: metav1.ObjectMeta{
@@ -1029,184 +1084,242 @@ func TestCalculateScaleDelta(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		replicas          int32
-		statusReplicas    int32
-		availableReplicas int32
-		maxUnavailable    *intstrutil.IntOrString
-		expectedDelta     int
-		description       string
+		name           string
+		replicas       int32
+		statusReplicas int32
+		failed         int
+		timedOut       int
+		dirtyCreates   int
+		maxUnavailable *intstrutil.IntOrString
+		expectedDelta  int
+		description    string
 	}{
 		{
-			name:              "scale up 10, no MaxUnavailable (unlimited)",
-			replicas:          10,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    nil,
-			expectedDelta:     10,
-			description:       "should return full delta when MaxUnavailable is not set",
+			name:           "scale up 10, no MaxUnavailable uses default 100%",
+			replicas:       10,
+			statusReplicas: 0,
+			maxUnavailable: nil,
+			expectedDelta:  10,
+			description:    "should allow full scale up when MaxUnavailable is not set (default 100%)",
 		},
 		{
-			name:              "scale up 10, MaxUnavailable=3",
-			replicas:          10,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(3)),
-			expectedDelta:     3,
-			description:       "should limit scale up to MaxUnavailable value",
+			name:           "default MaxUnavailable subtracts startup blockers",
+			replicas:       10,
+			statusReplicas: 2,
+			failed:         1,
+			timedOut:       1,
+			maxUnavailable: nil,
+			expectedDelta:  8,
+			description:    "default 100% of 10 minus 2 startup blockers leaves 8",
 		},
 		{
-			name:              "scale up 5 (from 2 to 7), MaxUnavailable=3",
-			replicas:          7,
-			statusReplicas:    2,
-			availableReplicas: 2,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(3)),
-			expectedDelta:     3,
-			description:       "should limit scale up delta to MaxUnavailable",
+			name:           "scale up 10, MaxUnavailable=3",
+			replicas:       10,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(3)),
+			expectedDelta:  3,
+			description:    "should limit scale up to MaxUnavailable value",
 		},
 		{
-			name:              "scale up 3, MaxUnavailable=5 (delta < maxUnavailable)",
-			replicas:          3,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(5)),
-			expectedDelta:     3,
-			description:       "should return actual delta when it's less than MaxUnavailable",
+			name:           "scale up 5 (from 2 to 7), MaxUnavailable=3",
+			replicas:       7,
+			statusReplicas: 2,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(3)),
+			expectedDelta:  3,
+			description:    "should limit scale up delta to MaxUnavailable",
 		},
 		{
-			name:              "scale up 10, MaxUnavailable=50%",
-			replicas:          10,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromString("50%")),
-			expectedDelta:     5,
-			description:       "should calculate percentage-based MaxUnavailable (50% of 10 = 5)",
+			name:           "scale up 3, MaxUnavailable=5 (delta < maxUnavailable)",
+			replicas:       3,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(5)),
+			expectedDelta:  3,
+			description:    "should return actual delta when it's less than MaxUnavailable",
 		},
 		{
-			name:              "scale up 20, MaxUnavailable=30%",
-			replicas:          20,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromString("30%")),
-			expectedDelta:     6,
-			description:       "should calculate percentage-based MaxUnavailable (30% of 20 = 6)",
+			name:           "scale up 10, MaxUnavailable=50%",
+			replicas:       10,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromString("50%")),
+			expectedDelta:  5,
+			description:    "should calculate percentage-based MaxUnavailable (50% of 10 = 5)",
 		},
 		{
-			name:              "scale up 6 (from 4 to 10), MaxUnavailable=20%",
-			replicas:          10,
-			statusReplicas:    4,
-			availableReplicas: 4,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromString("20%")),
-			expectedDelta:     2,
-			description:       "should limit to 20% of target replicas (20% of 10 = 2)",
+			name:           "scale up 20, MaxUnavailable=30%",
+			replicas:       20,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromString("30%")),
+			expectedDelta:  6,
+			description:    "should calculate percentage-based MaxUnavailable (30% of 20 = 6)",
 		},
 		{
-			name:              "MaxUnavailable=0, should block scale up",
-			replicas:          5,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(0)),
-			expectedDelta:     0,
-			description:       "should not allow any scale up when MaxUnavailable is 0",
+			name:           "scale up 6 (from 4 to 10), MaxUnavailable=20%",
+			replicas:       10,
+			statusReplicas: 4,
+			maxUnavailable: intOrStringPtr(intstrutil.FromString("20%")),
+			expectedDelta:  2,
+			description:    "should limit to 20% of target replicas (20% of 10 = 2)",
 		},
 		{
-			name:              "MaxUnavailable=1, scale up 1 at a time",
-			replicas:          5,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(1)),
-			expectedDelta:     1,
-			description:       "should only scale up 1 sandbox at a time",
+			name:           "MaxUnavailable=0, should block scale up",
+			replicas:       5,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(0)),
+			expectedDelta:  0,
+			description:    "should not allow any scale up when MaxUnavailable is 0",
 		},
 		{
-			name:              "no scaling needed (replicas match)",
-			replicas:          5,
-			statusReplicas:    5,
-			availableReplicas: 5,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(3)),
-			expectedDelta:     0,
-			description:       "should return 0 when no scaling is needed",
+			name:           "MaxUnavailable=1, scale up 1 at a time",
+			replicas:       5,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(1)),
+			expectedDelta:  1,
+			description:    "should only scale up 1 sandbox at a time",
 		},
 		{
-			name:              "scale down (negative delta), MaxUnavailable should not apply",
-			replicas:          3,
-			statusReplicas:    7,
-			availableReplicas: 7,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(2)),
-			expectedDelta:     -4,
-			description:       "MaxUnavailable should not limit scale down operations",
+			name:           "no scaling needed (replicas match)",
+			replicas:       5,
+			statusReplicas: 5,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(3)),
+			expectedDelta:  0,
+			description:    "should return 0 when no scaling is needed",
 		},
 		{
-			name:              "scale down without MaxUnavailable",
-			replicas:          2,
-			statusReplicas:    5,
-			availableReplicas: 5,
-			maxUnavailable:    nil,
-			expectedDelta:     -3,
-			description:       "should return negative delta for scale down",
+			name:           "scale down (negative delta), MaxUnavailable should not apply",
+			replicas:       3,
+			statusReplicas: 7,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(2)),
+			expectedDelta:  -4,
+			description:    "MaxUnavailable should not limit scale down operations",
 		},
 		{
-			name:              "large scale up with MaxUnavailable=100%",
-			replicas:          100,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromString("100%")),
-			expectedDelta:     100,
-			description:       "100% MaxUnavailable should allow full scale up",
+			name:           "scale down without MaxUnavailable",
+			replicas:       2,
+			statusReplicas: 5,
+			maxUnavailable: nil,
+			expectedDelta:  -3,
+			description:    "should return negative delta for scale down",
 		},
 		{
-			name:              "small percentage MaxUnavailable (10% of 100 = 10)",
-			replicas:          100,
-			statusReplicas:    0,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromString("10%")),
-			expectedDelta:     10,
-			description:       "should calculate 10% of 100 replicas correctly",
+			name:           "large scale up with MaxUnavailable=100%",
+			replicas:       100,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromString("100%")),
+			expectedDelta:  100,
+			description:    "100% MaxUnavailable should allow full scale up",
 		},
 		{
-			name:              "edge case: MaxUnavailable=1, scale up from 99 to 100",
-			replicas:          100,
-			statusReplicas:    99,
-			availableReplicas: 99,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(1)),
-			expectedDelta:     1,
-			description:       "should scale up 1 sandbox when delta equals MaxUnavailable",
+			name:           "small percentage MaxUnavailable (10% of 100 = 10)",
+			replicas:       100,
+			statusReplicas: 0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromString("10%")),
+			expectedDelta:  10,
+			description:    "should calculate 10% of 100 replicas correctly",
 		},
 		{
-			name:              "MaxUnavailable with creating sandboxes - should subtract creating",
-			replicas:          10,
-			statusReplicas:    3,
-			availableReplicas: 1,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(5)),
-			expectedDelta:     3,
-			description:       "should subtract creating sandboxes (3) from MaxUnavailable (5-2=3)",
+			name:           "edge case: MaxUnavailable=1, scale up from 99 to 100",
+			replicas:       100,
+			statusReplicas: 99,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(1)),
+			expectedDelta:  1,
+			description:    "should scale up 1 sandbox when delta equals MaxUnavailable",
 		},
 		{
-			name:              "MaxUnavailable becomes negative after subtracting creating",
-			replicas:          10,
-			statusReplicas:    5,
-			availableReplicas: 0,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(3)),
-			expectedDelta:     0,
-			description:       "should set to 0 when MaxUnavailable - creating < 0 (3-5=-2, set to 0)",
+			name:           "MaxUnavailable subtracts startup blockers",
+			replicas:       10,
+			statusReplicas: 3,
+			failed:         2,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(5)),
+			expectedDelta:  3,
+			description:    "should subtract startup blockers from MaxUnavailable (5-2=3)",
 		},
 		{
-			name:              "scale up with many creating sandboxes",
-			replicas:          10,
-			statusReplicas:    4,
-			availableReplicas: 2,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromString("50%")),
-			expectedDelta:     3,
-			description:       "50% of 10 = 5, minus 2 creating = 3",
+			name:           "MaxUnavailable becomes negative after subtracting startup blockers",
+			replicas:       10,
+			statusReplicas: 5,
+			failed:         3,
+			timedOut:       2,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(3)),
+			expectedDelta:  0,
+			description:    "should set to 0 when MaxUnavailable - blockers < 0 (3-5=-2, set to 0)",
 		},
 		{
-			name:              "zero delta when creating sandboxes >= MaxUnavailable",
-			replicas:          10,
-			statusReplicas:    6,
-			availableReplicas: 2,
-			maxUnavailable:    intOrStringPtr(intstrutil.FromInt(2)),
-			expectedDelta:     0,
-			description:       "MaxUnavailable=2 but already 4 creating, should not create more",
+			name:           "percentage MaxUnavailable subtracts startup blockers",
+			replicas:       10,
+			statusReplicas: 4,
+			failed:         1,
+			timedOut:       1,
+			maxUnavailable: intOrStringPtr(intstrutil.FromString("50%")),
+			expectedDelta:  3,
+			description:    "50% of 10 is 5, minus 2 blockers leaves 3",
+		},
+		{
+			name:           "zero delta when startup blockers reach MaxUnavailable",
+			replicas:       10,
+			statusReplicas: 6,
+			failed:         1,
+			timedOut:       1,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(2)),
+			expectedDelta:  0,
+			description:    "MaxUnavailable=2 and 2 startup blockers, so no more should be created",
+		},
+		{
+			name:           "healthy unavailable sandboxes do not reduce budget",
+			replicas:       5,
+			statusReplicas: 3,
+			failed:         0,
+			timedOut:       0,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(2)),
+			expectedDelta:  2,
+			description:    "healthy Creating sandboxes should not consume the scale-up budget",
+		},
+		{
+			name:           "healthy unavailable ignored while blockers counted",
+			replicas:       10,
+			statusReplicas: 6,
+			failed:         1,
+			timedOut:       1,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(4)),
+			expectedDelta:  2,
+			description:    "only failed and timed-out blockers reduce the budget",
+		},
+		{
+			name:           "dirty scale-up creations reduce budget",
+			replicas:       10,
+			statusReplicas: 2,
+			dirtyCreates:   2,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(3)),
+			expectedDelta:  1,
+			description:    "unobserved creations charge the budget (3-2=1)",
+		},
+		{
+			name:           "dirty scale-up creations exhaust budget",
+			replicas:       10,
+			statusReplicas: 2,
+			dirtyCreates:   2,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(2)),
+			expectedDelta:  0,
+			description:    "no headroom left when dirty creations equal MaxUnavailable",
+		},
+		{
+			name:           "dirty creations combined with startup blockers",
+			replicas:       10,
+			statusReplicas: 4,
+			failed:         1,
+			timedOut:       1,
+			dirtyCreates:   2,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(6)),
+			expectedDelta:  2,
+			description:    "failed, timed-out, and dirty creations all charge the budget (6-4=2)",
+		},
+		{
+			name:           "healthy creating free while dirty creations charged",
+			replicas:       10,
+			statusReplicas: 5,
+			dirtyCreates:   1,
+			maxUnavailable: intOrStringPtr(intstrutil.FromInt(3)),
+			expectedDelta:  2,
+			description:    "observed healthy Creating sandboxes stay free; only dirty creations charge (3-1=2)",
 		},
 	}
 
@@ -1220,12 +1333,10 @@ func TestCalculateScaleDelta(t *testing.T) {
 			}
 
 			status := &v1alpha1.SandboxSetStatus{
-				Replicas:          tt.statusReplicas,
-				AvailableReplicas: tt.availableReplicas,
+				Replicas: tt.statusReplicas,
 			}
 
-			delta := calculateScaleDelta(sbs, status)
-
+			delta := calculateScaleDelta(t.Context(), sbs, status, startupBlockers{Failed: tt.failed, TimedOut: tt.timedOut, DirtyCreates: tt.dirtyCreates})
 			assert.Equal(t, tt.expectedDelta, delta, tt.description)
 
 			// Additional validations

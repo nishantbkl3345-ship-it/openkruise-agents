@@ -25,27 +25,57 @@ import (
 
 func TestValidateE2BTimeoutFlags(t *testing.T) {
 	cases := []struct {
-		name             string
-		minResumeTimeout int
-		maxTimeout       int
-		expectError      string
+		name        string
+		maxTimeout  int
+		expectError string
 	}{
-		{name: "ok-default", minResumeTimeout: 300, maxTimeout: 2592000, expectError: ""},
-		{name: "ok-equal", minResumeTimeout: 60, maxTimeout: 60, expectError: ""},
-		{name: "zero-min", minResumeTimeout: 0, maxTimeout: 2592000, expectError: "--e2b-min-resume-timeout must be greater than 0"},
-		{name: "negative-min", minResumeTimeout: -1, maxTimeout: 2592000, expectError: "--e2b-min-resume-timeout must be greater than 0"},
-		{name: "min-exceeds-max", minResumeTimeout: 120, maxTimeout: 60, expectError: "must not exceed --e2b-max-timeout"},
+		{name: "ok-default", maxTimeout: 2592000, expectError: ""},
+		{name: "ok-small", maxTimeout: 60, expectError: ""},
+		{name: "zero", maxTimeout: 0, expectError: "--e2b-max-timeout must be greater than 0"},
+		{name: "negative", maxTimeout: -1, expectError: "--e2b-max-timeout must be greater than 0"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateE2BTimeoutFlags(tc.minResumeTimeout, tc.maxTimeout)
+			err := validateE2BTimeoutFlags(tc.maxTimeout)
 			if tc.expectError == "" {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tc.expectError)
 			}
+		})
+	}
+}
+
+func TestValidateMetricsPort(t *testing.T) {
+	cases := []struct {
+		name               string
+		metricsPort        int
+		controlPort        int
+		memberlistBindPort int
+		expectError        string
+	}{
+		{name: "shared-zero", controlPort: 8080, memberlistBindPort: 7946},
+		{name: "shared-control-listener", metricsPort: 8080, controlPort: 8080, memberlistBindPort: 7946},
+		{name: "min-valid", metricsPort: 1, controlPort: 8080, memberlistBindPort: 7946},
+		{name: "max-valid", metricsPort: 65535, controlPort: 8080, memberlistBindPort: 7946},
+		{name: "negative", metricsPort: -1, controlPort: 8080, memberlistBindPort: 7946, expectError: "valid TCP port"},
+		{name: "too-large", metricsPort: 65536, controlPort: 8080, memberlistBindPort: 7946, expectError: "valid TCP port"},
+		{name: "matches-default-memberlist-port", metricsPort: 7946, controlPort: 8080, memberlistBindPort: 7946, expectError: "must differ from --memberlist-bind-port"},
+		{name: "matches-custom-memberlist-port", metricsPort: 9000, controlPort: 8080, memberlistBindPort: 9000, expectError: "must differ from --memberlist-bind-port"},
+		{name: "matches-normalized-default-memberlist-port", metricsPort: 7946, controlPort: 8080, memberlistBindPort: 0, expectError: "must differ from --memberlist-bind-port"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMetricsPort(tc.metricsPort, tc.controlPort, tc.memberlistBindPort)
+			if tc.expectError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectError)
 		})
 	}
 }

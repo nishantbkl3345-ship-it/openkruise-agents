@@ -35,6 +35,7 @@ import (
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/agent-runtime/storages"
+	"github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/cache/cachetest"
 	"github.com/openkruise/agents/pkg/features"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
@@ -159,6 +160,38 @@ func TestNewClaimControl_ForwardsRuntimeTLSBundle(t *testing.T) {
 	assert.Same(t, bundle, cc.runtimeTLSBundle, "runtime TLS bundle must be forwarded to commonControl")
 }
 
+func TestCommonControl_BuildClaimOptionsScopesToClaimNamespace(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = agentsv1alpha1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		Build()
+	control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), nil, nil).(*commonControl)
+
+	claim := &agentsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "team-a",
+			UID:       "test-uid",
+		},
+		Spec: agentsv1alpha1.SandboxClaimSpec{
+			TemplateName:    "shared-pool",
+			SkipInitRuntime: true,
+		},
+	}
+	sandboxSet := &agentsv1alpha1.SandboxSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "shared-pool",
+			Namespace: "team-a",
+		},
+	}
+
+	opts, err := control.buildClaimOptions(context.Background(), claim, sandboxSet)
+	require.NoError(t, err)
+	assert.Equal(t, claim.Namespace, opts.Namespace)
+}
+
 func TestCommonControl_EnsureClaimClaiming(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = agentsv1alpha1.AddToScheme(scheme)
@@ -204,6 +237,47 @@ func TestCommonControl_EnsureClaimClaiming(t *testing.T) {
 			expectError:      false,
 			checkStatus: func(t *testing.T, status *agentsv1alpha1.SandboxClaimStatus) {
 				assert.Equal(t, int32(0), status.ClaimedReplicas, "ClaimedReplicas mismatch")
+			},
+		},
+		{
+			name: "invalid reserved identity key - should complete without retry",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-invalid",
+					Namespace: "default",
+					UID:       "test-uid-invalid",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+					Replicas:     int32Ptr(1),
+					Labels: map[string]string{
+						agentsv1alpha1.LabelSandboxID: "spoofed-id",
+					},
+				},
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+			},
+			newStatus: &agentsv1alpha1.SandboxClaimStatus{
+				Phase:           agentsv1alpha1.SandboxClaimPhaseClaiming,
+				ClaimedReplicas: 0,
+			},
+			expectedStrategy: NoRequeue(),
+			expectError:      false,
+			checkStatus: func(t *testing.T, status *agentsv1alpha1.SandboxClaimStatus) {
+				assert.Equal(t, agentsv1alpha1.SandboxClaimPhaseCompleted, status.Phase)
+				assert.Contains(t, status.Message, agentsv1alpha1.LabelSandboxID)
+				// User-facing message must show the validation reason,
+				// not the internal claim-options wrapping.
+				assert.NotContains(t, status.Message, "failed to build claim options")
+				condition := GetClaimCondition(status, string(agentsv1alpha1.SandboxClaimConditionCompleted))
+				require.NotNil(t, condition)
+				assert.Equal(t, "InvalidClaimSpec", condition.Reason)
+				assert.Contains(t, condition.Message, agentsv1alpha1.LabelSandboxID)
+				assert.NotContains(t, condition.Message, "failed to build claim options")
 			},
 		},
 		{
@@ -567,7 +641,7 @@ func TestCommonControl_EnsureClaimClaiming_ClaimedGreaterThanZero(t *testing.T) 
 	assert.Equal(t, int32(1), newStatus.ClaimedReplicas, "ClaimedReplicas should be 1")
 }
 
-func TestCommonControl_EnsureClaimClaiming_CPUResizeFeatureGatePrecondition(t *testing.T) {
+func TestCommonControl_EnsureClaimClaiming_ResourceResizeFeatureGatePrecondition(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = agentsv1alpha1.AddToScheme(scheme)
 
@@ -583,7 +657,7 @@ func TestCommonControl_EnsureClaimClaiming_CPUResizeFeatureGatePrecondition(t *t
 				Replicas:     int32Ptr(1),
 				InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
 					Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
-						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
 					},
 				},
 			},
@@ -662,6 +736,151 @@ func TestCommonControl_EnsureClaimClaiming_CPUResizeFeatureGatePrecondition(t *t
 		assert.Equal(t, agentsv1alpha1.SandboxClaimPhaseClaiming, newStatus.Phase)
 		assert.Equal(t, int32(0), newStatus.ClaimedReplicas)
 	})
+}
+
+func TestCommonControl_EnsureClaimClaiming_ResizeIncompatibleSandboxRetries(t *testing.T) {
+	claim := &agentsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim-resize-downscale",
+			Namespace: "default",
+			UID:       types.UID("test-uid-resize-downscale"),
+		},
+		Spec: agentsv1alpha1.SandboxClaimSpec{
+			TemplateName: "test-template",
+			Replicas:     int32Ptr(1),
+			InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+				Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+				},
+			},
+		},
+	}
+	sandboxSet := &agentsv1alpha1.SandboxSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+	}
+	provider, fakeClient, err := cachetest.NewTestCache(t)
+	require.NoError(t, err)
+
+	// The only warm sandbox runs 256Mi, so a 128Mi claim is a downscale: every
+	// candidate is incompatible and the claim must keep retrying.
+	warm := &agentsv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "warm-sbx",
+			Namespace:         "default",
+			Labels:            map[string]string{agentsv1alpha1.LabelSandboxTemplate: "test-template"},
+			Annotations:       map[string]string{},
+			CreationTimestamp: metav1.Now(),
+			OwnerReferences:   []metav1.OwnerReference{*metav1.NewControllerRef(sandboxSet, agentsv1alpha1.SandboxSetControllerKind)},
+		},
+		Spec: agentsv1alpha1.SandboxSpec{
+			EmbeddedSandboxTemplate: agentsv1alpha1.EmbeddedSandboxTemplate{
+				Template: &corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "main",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+							},
+						}},
+					},
+				},
+			},
+		},
+		Status: agentsv1alpha1.SandboxStatus{
+			Phase:      agentsv1alpha1.SandboxRunning,
+			Conditions: []metav1.Condition{{Type: string(agentsv1alpha1.SandboxConditionReady), Status: metav1.ConditionTrue}},
+			PodInfo:    agentsv1alpha1.PodInfo{PodIP: "1.2.3.4"},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), warm))
+	require.NoError(t, fakeClient.Status().Update(t.Context(), warm))
+	require.Eventually(t, func() bool {
+		objs, err := provider.ListSandboxesInPool(t.Context(), cache.ListSandboxesInPoolOptions{Pool: "test-template"})
+		return err == nil && len(objs) == 1
+	}, 200*time.Millisecond, 5*time.Millisecond)
+
+	newStatus := &agentsv1alpha1.SandboxClaimStatus{Phase: agentsv1alpha1.SandboxClaimPhaseClaiming}
+	control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), provider, nil)
+
+	strategy, err := control.EnsureClaimClaiming(t.Context(), ClaimArgs{
+		Claim:      claim,
+		SandboxSet: sandboxSet,
+		NewStatus:  newStatus,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, RequeueAfter(ClaimRetryInterval), strategy)
+	assert.Equal(t, agentsv1alpha1.SandboxClaimPhaseClaiming, newStatus.Phase)
+	assert.Equal(t, int32(0), newStatus.ClaimedReplicas)
+	// The sandbox must stay in the pool, untouched by the failed attempt.
+	got := &agentsv1alpha1.Sandbox{}
+	require.NoError(t, fakeClient.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "warm-sbx"}, got))
+	assert.Empty(t, got.Annotations[agentsv1alpha1.AnnotationOwner])
+}
+
+func TestCommonControl_EnsureClaimClaiming_InvalidInplaceUpdateResourcesFailsFast(t *testing.T) {
+	sandboxSet := &agentsv1alpha1.SandboxSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+	}
+
+	tests := []struct {
+		name      string
+		requests  corev1.ResourceList
+		limits    corev1.ResourceList
+		expectMsg string
+	}{
+		{
+			name:      "cpu request exceeding limit",
+			requests:  corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+			limits:    corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			expectMsg: "must not exceed limit",
+		},
+		{
+			name:      "unsupported resource",
+			requests:  corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+			expectMsg: "not supported for in-place resize",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache, fakeClient, err := cachetest.NewTestCache(t)
+			require.NoError(t, err)
+
+			claim := &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-invalid-resize",
+					Namespace: "default",
+					UID:       types.UID("test-uid-invalid-resize"),
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+					Replicas:     int32Ptr(1),
+					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
+						Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
+							Requests: tt.requests,
+							Limits:   tt.limits,
+						},
+					},
+				},
+			}
+			newStatus := &agentsv1alpha1.SandboxClaimStatus{Phase: agentsv1alpha1.SandboxClaimPhaseClaiming}
+			control := NewCommonControl(fakeClient, record.NewFakeRecorder(10), cache, nil)
+
+			strategy, err := control.EnsureClaimClaiming(t.Context(), ClaimArgs{
+				Claim:      claim,
+				SandboxSet: sandboxSet,
+				NewStatus:  newStatus,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, NoRequeue(), strategy)
+			assert.Equal(t, agentsv1alpha1.SandboxClaimPhaseCompleted, newStatus.Phase)
+			assert.Equal(t, int32(0), newStatus.ClaimedReplicas)
+			assert.Contains(t, newStatus.Message, tt.expectMsg)
+			cond := GetClaimCondition(newStatus, string(agentsv1alpha1.SandboxClaimConditionCompleted))
+			require.NotNil(t, cond)
+			assert.Equal(t, "InvalidInplaceUpdateResources", cond.Reason)
+		})
+	}
 }
 
 func TestCommonControl_EnsureClaimCompleted(t *testing.T) {
@@ -1061,16 +1280,22 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 			name: "claim with inplaceUpdate resources",
 			claim: &agentsv1alpha1.SandboxClaim{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-claim-cpu-resize",
+					Name:      "test-claim-resource-resize",
 					Namespace: "default",
-					UID:       "test-uid-cpu-resize",
+					UID:       "test-uid-resource-resize",
 				},
 				Spec: agentsv1alpha1.SandboxClaimSpec{
 					TemplateName: "test-template",
 					InplaceUpdate: &agentsv1alpha1.SandboxClaimInplaceUpdateOptions{
 						Resources: &agentsv1alpha1.SandboxClaimInplaceUpdateResourcesOptions{
-							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
-							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("1Gi"),
+							},
 						},
 					},
 				},
@@ -1089,6 +1314,10 @@ func TestCommonControl_buildClaimOptions(t *testing.T) {
 				reqCPU := opts.InplaceUpdate.Resources.Requests[corev1.ResourceCPU]
 				if reqCPU.String() != "500m" {
 					t.Errorf("InplaceUpdate.Resources.Requests[cpu] = %v, want 500m", reqCPU.String())
+				}
+				reqMemory := opts.InplaceUpdate.Resources.Requests[corev1.ResourceMemory]
+				if reqMemory.String() != "512Mi" {
+					t.Errorf("InplaceUpdate.Resources.Requests[memory] = %v, want 512Mi", reqMemory.String())
 				}
 			},
 		},
@@ -2935,6 +3164,107 @@ func TestBuildClaimOptions_CSIMount_Test(t *testing.T) {
 				require.True(t, ok, "attributes should be a map")
 				assert.Equal(t, "encrypted-data", attrs["sub-path"], "sub-path attribute mismatch")
 				assert.Equal(t, "cmk-12345", attrs["kms-key-id"], "kms-key-id attribute mismatch")
+			},
+		},
+		{
+			name: "CSI mount with bucketSpacePrefix and region injects storage-auth annotation with agentic bucket attributes",
+			claim: &agentsv1alpha1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-claim-csi-agentic-bucket",
+					Namespace: "default",
+					UID:       "test-uid-agentic-bucket",
+				},
+				Spec: agentsv1alpha1.SandboxClaimSpec{
+					TemplateName: "test-template",
+					DynamicVolumesMount: []agentsv1alpha1.CSIMountConfig{
+						{
+							PvName:    "test-pv-nas",
+							MountPath: "/data",
+							SubPath:   "user-data",
+							Attributes: map[string]string{
+								"credentialProviderName": "oss-bs-rw",
+								"bucketSpacePrefix":      "sandbox-a",
+								"region":                 "cn-hangzhou",
+							},
+						},
+					},
+				},
+			},
+			setup: func(t *testing.T) {
+				origHook := csiutils.BuildStorageAuthAnnotation
+				t.Cleanup(func() { csiutils.BuildStorageAuthAnnotation = origHook })
+				csiutils.BuildStorageAuthAnnotation = func(_ context.Context, _ client.Client, mounts []agentsv1alpha1.CSIMountConfig) (string, string, error) {
+					type storageAuthItem struct {
+						CredentialProviderName string            `json:"credentialProviderName"`
+						Attributes             map[string]string `json:"attributes,omitempty"`
+					}
+					var items []storageAuthItem
+					for _, m := range mounts {
+						if cpName, ok := m.Attributes["credentialProviderName"]; ok {
+							attrs := map[string]string{}
+							if m.SubPath != "" {
+								attrs["sub-path"] = m.SubPath
+							}
+							if bs := m.Attributes["bucketSpace"]; bs != "" {
+								attrs["bucket-space-name"] = bs
+							} else if bsp := m.Attributes["bucketSpacePrefix"]; bsp != "" {
+								attrs["bucket-space-prefix"] = bsp
+								if r := m.Attributes["region"]; r != "" {
+									attrs["region"] = r
+								}
+							}
+							items = append(items, storageAuthItem{
+								CredentialProviderName: cpName,
+								Attributes:             attrs,
+							})
+						}
+					}
+					if len(items) == 0 {
+						return "", "", nil
+					}
+					data, err := json.Marshal(items)
+					if err != nil {
+						return "", "", err
+					}
+					return "security.agents.kruise.io/storage-auth", string(data), nil
+				}
+			},
+			sandboxSet: &agentsv1alpha1.SandboxSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+				Spec: agentsv1alpha1.SandboxSetSpec{
+					Runtimes: []agentsv1alpha1.RuntimeConfig{
+						{Name: agentsv1alpha1.RuntimeConfigForInjectAgentRuntime},
+					},
+				},
+			},
+			expectError:        false,
+			expectedMountCount: 1,
+			validate: func(t *testing.T, opts infra.ClaimSandboxOptions) {
+				require.NotNil(t, opts.CSIMount, "CSIMount should not be nil")
+				mockSandbox := &sandboxcr.Sandbox{
+					Sandbox: &agentsv1alpha1.Sandbox{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "test-sandbox",
+							Namespace: "default",
+						},
+					},
+				}
+				opts.Modifier(mockSandbox)
+				storageAuthVal := mockSandbox.GetAnnotations()["security.agents.kruise.io/storage-auth"]
+				assert.NotEmpty(t, storageAuthVal, "storage-auth annotation should be injected")
+				var items []map[string]interface{}
+				err := json.Unmarshal([]byte(storageAuthVal), &items)
+				require.NoError(t, err, "storage-auth should be valid JSON")
+				assert.Len(t, items, 1, "Expected 1 storage auth item")
+				assert.Equal(t, "oss-bs-rw", items[0]["credentialProviderName"], "credentialProviderName mismatch")
+				attrs, ok := items[0]["attributes"].(map[string]interface{})
+				require.True(t, ok, "attributes should be a map")
+				assert.Equal(t, "sandbox-a", attrs["bucket-space-prefix"], "bucket-space-prefix attribute mismatch")
+				assert.Equal(t, "cn-hangzhou", attrs["region"], "region attribute mismatch")
+				assert.Equal(t, "user-data", attrs["sub-path"], "sub-path attribute mismatch")
 			},
 		},
 		{

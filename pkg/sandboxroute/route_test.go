@@ -129,6 +129,7 @@ func TestRouteFromSandboxDerivation(t *testing.T) {
 		expectID    string
 		expectToken string
 		expectAuth  bool
+		expectWake  bool
 		expectState string
 		expectIP    string
 		expectError string
@@ -174,6 +175,20 @@ func TestRouteFromSandboxDerivation(t *testing.T) {
 				identity.AnnotationEnableJwtAuth: "True",
 			}),
 			expectID: "ns--name",
+		},
+		{
+			name: "wake-on-traffic from spec rule",
+			sandbox: func() *agentsv1alpha1.Sandbox {
+				sandbox := newSandbox(nil, nil)
+				sandbox.Spec.AutoPausePolicy = &agentsv1alpha1.AutoPausePolicy{
+					Resume: &agentsv1alpha1.ResumePolicy{
+						OnIngressTraffic: &agentsv1alpha1.IngressTrafficRule{},
+					},
+				}
+				return sandbox
+			}(),
+			expectID:   "ns--name",
+			expectWake: true,
 		},
 		{
 			name: "empty IP normalizes to creating",
@@ -241,6 +256,7 @@ func TestRouteFromSandboxDerivation(t *testing.T) {
 			assert.Equal(t, "owner", route.Owner)
 			assert.Equal(t, tt.expectToken, route.AccessToken)
 			assert.Equal(t, tt.expectAuth, route.RequireTrafficAuth)
+			assert.Equal(t, tt.expectWake, route.WakeOnTraffic)
 		})
 	}
 }

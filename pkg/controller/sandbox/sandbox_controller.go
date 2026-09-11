@@ -17,11 +17,13 @@ limitations under the License.
 package sandbox
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"reflect"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -48,6 +50,7 @@ import (
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
+	"github.com/openkruise/agents/pkg/utils/fieldindex"
 	runtimeclient "github.com/openkruise/agents/pkg/utils/runtime"
 	timeoututils "github.com/openkruise/agents/pkg/utils/timeout"
 
@@ -56,6 +59,9 @@ import (
 
 func init() {
 	flag.IntVar(&concurrentReconciles, "sandbox-workers", concurrentReconciles, "Max concurrent reconciles for Sandbox controller.")
+	flag.DurationVar(&maxPendingTimeout, "max-pending-timeout", maxPendingTimeout,
+		"Maximum time a Sandbox may remain Pending before consuming its SandboxSet startup budget. "+
+			"Values below 15s are normalized to 15s and values above 3590s are capped at 3590s.")
 	flag.DurationVar(&recycleTimeout, "recycle-timeout", recycleTimeout, "Timeout for sandbox recycle operations.")
 	flag.DurationVar(&recycleGracePeriod, "recycle-grace-period", recycleGracePeriod, "Grace period after recycle before sandbox returns to pool.")
 	flag.DurationVar(&recycleFailureShutdownGrace, "recycle-failure-shutdown-grace", recycleFailureShutdownGrace, "Grace period before shutting down a sandbox after recycle failure.")
@@ -72,6 +78,7 @@ func init() {
 var (
 	concurrentReconciles        = 500
 	sandboxControllerKind       = agentsv1alpha1.GroupVersion.WithKind("Sandbox")
+	maxPendingTimeout           = 50 * time.Second
 	recycleTimeout              = 60 * time.Second
 	recycleGracePeriod          = 10 * time.Second
 	recycleFailureShutdownGrace = 5 * time.Minute
@@ -82,7 +89,16 @@ var (
 
 const (
 	eventReasonSandboxTerminating = "SandboxTerminating"
+	minimumPendingTimeout         = 15 * time.Second
+	maximumPendingTimeout         = 3590 * time.Second
+	checkpointCreationWaitTimeout = 5 * time.Minute
+	checkpointWaitRequeueInterval = 5 * time.Second
 )
+
+// MaxPendingTimeout returns the normalized process-wide Sandbox Pending timeout.
+func MaxPendingTimeout() time.Duration {
+	return min(max(maxPendingTimeout, minimumPendingTimeout), maximumPendingTimeout)
+}
 
 type sandboxPhaseTransition struct {
 	oldPhase agentsv1alpha1.SandboxPhase
@@ -123,6 +139,9 @@ func Add(mgr manager.Manager, metricsCleanup Enqueuer, runtimeTLSBundle *runtime
 	}
 	if metricsCleanup == nil {
 		return fmt.Errorf("sandbox: metricsCleanup enqueuer is required")
+	}
+	if effective := MaxPendingTimeout(); effective != maxPendingTimeout {
+		klog.Warningf("Invalid max-pending-timeout %s; using %s", maxPendingTimeout, effective)
 	}
 
 	rateLimiter := core.NewRateLimiter()
@@ -179,6 +198,7 @@ type SandboxReconciler struct {
 	checkpointControl *core.CheckpointControl
 	metricsCleanup    Enqueuer
 	recorder          record.EventRecorder
+	messageRegexCache compiledMessageRegexCache
 }
 
 // +kubebuilder:rbac:groups=agents.kruise.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
@@ -278,8 +298,23 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (cr
 	// span this early does not produce noise.
 	ctx, reconcileSpan := tracing.StartReconcileSpan(ctx, box)
 	reconcileSpan.SetAttributes(attribute.String(tracing.AttrSandboxPhase, string(box.Status.Phase)))
+	// Record condition values at the start of this Reconcile iteration so
+	// the before->after transition is visible when comparing this span with
+	// the child updateSandboxStatus span.
+	for _, cond := range box.Status.Conditions {
+		reconcileSpan.SetAttributes(attribute.String(
+			tracing.AttrConditionPrefix+cond.Type,
+			fmt.Sprintf("%s:%s", cond.Status, cond.Reason),
+		))
+	}
 	if traceID := tracing.TraceIDFromContext(ctx); traceID != "" {
-		ctx = klog.NewContext(ctx, klog.FromContext(ctx).WithValues("traceID", traceID))
+		logValues := []any{tracing.TraceIDLogKey, traceID}
+		// Surface the user operation that started this trace (propagated via
+		// baggage in the CR annotation) so logs can be filtered by operation.
+		if op := tracing.TraceOperationFromContext(ctx); op != "" {
+			logValues = append(logValues, tracing.TraceOperationLogKey, op)
+		}
+		ctx = klog.NewContext(ctx, klog.FromContext(ctx).WithValues(logValues...))
 	}
 	// End the Reconcile span with the final Reconcile error via defer: a
 	// failing iteration is marked failed and always retained even when the
@@ -353,15 +388,21 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (cr
 		tracing.EndSpan(ctx, span, err)
 	case agentsv1alpha1.SandboxPaused:
 		ctx, span := tracing.StartControllerSpan(ctx, tracing.SpanControllerEnsureSandboxPaused)
-		err = r.preparePausedPhase(ctx, args)
-		if err != nil {
-			tracing.EndSpan(ctx, span, err)
-			return reconcile.Result{}, err
+		waitForCheckpoint, prepareErr := r.preparePausedPhase(ctx, args)
+		if prepareErr != nil {
+			tracing.EndSpan(ctx, span, prepareErr)
+			return reconcile.Result{}, prepareErr
 		}
-		// EnsureSandboxPaused is called unconditionally: it drives the pause
-		// state machine to completion (Paused reaches Status=True only after
-		// the pod is fully deleted) and is idempotent once the pause has
-		// finished.
+		if waitForCheckpoint {
+			if requeueAfter == 0 || checkpointWaitRequeueInterval < requeueAfter {
+				requeueAfter = checkpointWaitRequeueInterval
+			}
+			tracing.EndSpan(ctx, span, nil)
+			break
+		}
+		// Once the pre-pause checkpoint gate clears, EnsureSandboxPaused drives
+		// the pause state machine to completion (Paused reaches Status=True only
+		// after the pod is fully deleted) and is idempotent once pause finishes.
 		err = r.getControl(args.Pod).EnsureSandboxPaused(ctx, args)
 		tracing.EndSpan(ctx, span, err)
 	case agentsv1alpha1.SandboxResuming:
@@ -395,22 +436,40 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (cr
 	if newStatus.Phase != phaseBefore {
 		klog.FromContext(ctx).Info("Sandbox phase finished", "sandbox", klog.KObj(box), "phase", string(phaseBefore), "nextPhase", string(newStatus.Phase))
 	}
+
+	// Handle auto-pause policy (probe-driven pause/resume decisions).
+	// Evaluated after calculateStatus and Ensure* so that probe conditions
+	// synced in the current reconcile cycle are available. Phase transitions
+	// triggered by Spec.Paused patching take effect in the next reconcile.
+	if autoPauseTakesOver(box) {
+		autoPauseRequeue, err := r.handleAutoPause(ctx, box, newStatus)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if autoPauseRequeue > 0 && (requeueAfter == 0 || autoPauseRequeue < requeueAfter) {
+			requeueAfter = autoPauseRequeue
+		}
+	}
+
 	return ctrl.Result{RequeueAfter: requeueAfter}, r.updateSandboxStatus(ctx, *newStatus, box)
 }
 
-// preparePausedPhase initializes the Paused condition and sets Ready to false
-// before delegating to the control-specific EnsureSandboxPaused logic.
-func (r *SandboxReconciler) preparePausedPhase(ctx context.Context, args core.EnsureFuncArgs) error {
+// preparePausedPhase initializes the Paused condition, waits for a recent
+// in-progress Checkpoint, and sets Ready to false before delegating to the
+// control-specific EnsureSandboxPaused logic. The boolean result reports
+// whether the pause flow must wait before invoking EnsureSandboxPaused.
+func (r *SandboxReconciler) preparePausedPhase(ctx context.Context, args core.EnsureFuncArgs) (bool, error) {
 	box, newStatus := args.Box, args.NewStatus
+	logger := klog.FromContext(ctx).WithValues("sandbox", klog.KObj(box))
 	cond := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionPaused))
 	if cond == nil {
 		// Add finalizer on first entry into paused state to ensure
 		// controller-mediated cleanup if the sandbox is deleted while paused.
 		if !controllerutil.ContainsFinalizer(box, core.SandboxFinalizer) {
 			if _, err := utils.PatchFinalizer(ctx, r.Client, box, utils.AddFinalizerOpType, core.SandboxFinalizer); err != nil {
-				return fmt.Errorf("failed to add finalizer for paused sandbox: %w", err)
+				return false, fmt.Errorf("failed to add finalizer for paused sandbox: %w", err)
 			}
-			klog.FromContext(ctx).Info("Add finalizer for paused sandbox", "sandbox", klog.KObj(box))
+			logger.Info("Add finalizer for paused sandbox")
 		}
 		cond = &metav1.Condition{
 			Type:               string(agentsv1alpha1.SandboxConditionPaused),
@@ -419,23 +478,91 @@ func (r *SandboxReconciler) preparePausedPhase(ctx context.Context, args core.En
 			LastTransitionTime: metav1.Now(),
 		}
 		utils.SetSandboxCondition(newStatus, *cond)
-		klog.FromContext(ctx).Info("Paused condition initialized", "sandbox", klog.KObj(box))
+		logger.Info("Paused condition initialized")
 	}
 	// The paused phase sets condition ready to false.
 	if rCond := utils.GetSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionReady)); rCond != nil && rCond.Status == metav1.ConditionTrue {
 		rCond.Status = metav1.ConditionFalse
 		rCond.LastTransitionTime = metav1.Now()
 		utils.SetSandboxCondition(newStatus, *rCond)
-		klog.FromContext(ctx).Info("The paused phase sets condition ready to false", "sandbox", klog.KObj(box))
+		logger.Info("The paused phase sets condition ready to false")
 	}
-	return nil
+
+	// Only gate the initial pause entry. Once this controller starts its own
+	// checkpoint, CheckpointControl is responsible for driving that checkpoint.
+	if cond.Status != metav1.ConditionFalse ||
+		(cond.Reason != agentsv1alpha1.SandboxPausedReasonPending &&
+			cond.Reason != agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint) {
+		return false, nil
+	}
+	checkpoints := &agentsv1alpha1.CheckpointList{}
+	if err := r.List(ctx, checkpoints,
+		client.InNamespace(box.Namespace),
+		client.MatchingFields{fieldindex.IndexNameForCheckpointSandboxName: box.Name},
+		client.UnsafeDisableDeepCopy,
+	); err != nil {
+		return false, fmt.Errorf("failed to list checkpoints for sandbox %s/%s: %w", box.Namespace, box.Name, err)
+	}
+	now := time.Now()
+	activeCheckpoints := make([]*agentsv1alpha1.Checkpoint, 0, len(checkpoints.Items))
+	for i := range checkpoints.Items {
+		checkpoint := &checkpoints.Items[i]
+		if !checkpoint.DeletionTimestamp.IsZero() ||
+			(checkpoint.Status.Phase != "" &&
+				checkpoint.Status.Phase != agentsv1alpha1.CheckpointPending &&
+				checkpoint.Status.Phase != agentsv1alpha1.CheckpointCreating) {
+			continue
+		}
+		if !checkpoint.CreationTimestamp.IsZero() && now.Sub(checkpoint.CreationTimestamp.Time) > checkpointCreationWaitTimeout {
+			logger.Info("Ignore timed-out in-progress checkpoint before pause",
+				"checkpoint", klog.KObj(checkpoint), "phase", checkpoint.Status.Phase,
+				"age", now.Sub(checkpoint.CreationTimestamp.Time))
+			continue
+		}
+		activeCheckpoints = append(activeCheckpoints, checkpoint)
+	}
+
+	var blockingCheckpoint *agentsv1alpha1.Checkpoint
+	if len(activeCheckpoints) > 0 {
+		blockingCheckpoint = slices.MaxFunc(activeCheckpoints, func(a, b *agentsv1alpha1.Checkpoint) int {
+			return cmp.Or(
+				a.CreationTimestamp.Time.Compare(b.CreationTimestamp.Time),
+				cmp.Compare(b.Name, a.Name),
+			)
+		})
+	}
+	if blockingCheckpoint != nil {
+		phase := string(blockingCheckpoint.Status.Phase)
+		if phase == "" {
+			phase = "<empty>"
+		}
+		message := fmt.Sprintf("Pause is waiting for existing checkpoint %s to complete (phase: %s)", blockingCheckpoint.Name, phase)
+		recordEvent := cond.Reason != agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint || cond.Message != message
+		cond.Reason = agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint
+		cond.Message = message
+		utils.SetSandboxCondition(newStatus, *cond)
+		if recordEvent && r.recorder != nil {
+			r.recorder.Event(box, corev1.EventTypeNormal, agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint, message)
+		}
+		logger.Info("Wait for in-progress checkpoint before pause",
+			"checkpoint", klog.KObj(blockingCheckpoint), "phase", blockingCheckpoint.Status.Phase)
+		return true, nil
+	}
+	// Restore the initial pause state once no in-progress checkpoint blocks the
+	// flow, so CheckpointControl can start and report its own checkpoint state.
+	if cond.Reason == agentsv1alpha1.SandboxPausedReasonWaitingForExistingCheckpoint || cond.Message != "" {
+		cond.Reason = agentsv1alpha1.SandboxPausedReasonPending
+		cond.Message = ""
+		utils.SetSandboxCondition(newStatus, *cond)
+	}
+	return false, nil
 }
 
 // finalizeResumePhase performs the common cleanup once a resume succeeds,
 // mirroring preparePausedPhase on the pause side: it drops the Paused
-// condition, which was kept through Resuming, so the next pause cycle starts
-// fresh, and removes the finalizer added when the sandbox entered the paused
-// phase.
+// condition, which was kept through Resuming, and the probe state left behind
+// by the pod the pause deleted, so the next pause cycle starts fresh. It also
+// removes the finalizer added when the sandbox entered the paused phase.
 //
 // Finalizer removal is best-effort: a failure is logged but does not block
 // the resume, because EnsureSandboxTerminated removes the finalizer as a
@@ -443,6 +570,7 @@ func (r *SandboxReconciler) preparePausedPhase(ctx context.Context, args core.En
 func (r *SandboxReconciler) finalizeResumePhase(ctx context.Context, args core.EnsureFuncArgs) {
 	box, newStatus := args.Box, args.NewStatus
 	utils.RemoveSandboxCondition(newStatus, string(agentsv1alpha1.SandboxConditionPaused))
+	resetProbeDrivenState(newStatus)
 	if !controllerutil.ContainsFinalizer(box, core.SandboxFinalizer) {
 		return
 	}
@@ -506,9 +634,16 @@ func (r *SandboxReconciler) updateSandboxStatus(ctx context.Context, newStatus a
 	// independent value on the shouldRequeue early-return path, where the
 	// Reconcile span's phase attribute has not been refreshed; the full
 	// before->after transition is recorded in logs and K8s Events.
-	ctx, span := tracing.StartControllerSpan(ctx, tracing.SpanControllerUpdateStatus,
+	statusAttrs := []attribute.KeyValue{
 		attribute.String(tracing.AttrPhaseAfter, string(newStatus.Phase)),
-	)
+	}
+	for _, cond := range newStatus.Conditions {
+		statusAttrs = append(statusAttrs, attribute.String(
+			tracing.AttrConditionPrefix+cond.Type,
+			fmt.Sprintf("%s:%s", cond.Status, cond.Reason),
+		))
+	}
+	ctx, span := tracing.StartControllerSpan(ctx, tracing.SpanControllerUpdateStatus, statusAttrs...)
 
 	by, _ := json.Marshal(newStatus)
 	patchStatus := fmt.Sprintf(`{"status":%s}`, string(by))
@@ -904,8 +1039,14 @@ func (r *SandboxReconciler) checkTimers(ctx context.Context, box *agentsv1alpha1
 	if done, err := r.handleShutdownTimeout(ctx, box, now); done {
 		return ctrl.Result{}, true, err
 	}
-	if result, done, err := r.handlePauseTimeout(ctx, box, now); done {
-		return result, true, err
+	if box.Spec.PauseTime != nil && !box.Spec.Paused {
+		// The one-shot PauseTime deadline and an AutoPausePolicy pause rule both
+		// stay in force; whichever comes due first pauses the sandbox. They only
+		// ever move Spec.Paused in the same direction, and a pause performed here
+		// ends the reconcile, so the probe-driven loop cannot write behind it.
+		if result, done, err := r.handlePauseTimeout(ctx, box, now); done {
+			return result, true, err
+		}
 	}
 	return ctrl.Result{RequeueAfter: r.calcTimeoutRequeue(box, now)}, false, nil
 }
@@ -958,19 +1099,17 @@ func (r *SandboxReconciler) handleShutdownTimeout(ctx context.Context, box *agen
 	if box.Spec.ShutdownTime == nil || !box.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
-	if !box.Spec.ShutdownTime.Before(&now) {
+	if box.Spec.ShutdownTime.After(now.Time) {
 		return false, nil
 	}
 
-	// When the paused-retention annotation is present, the sandbox has not
-	// yet paused, AND PauseTime has already been reached, skip deletion:
-	// handlePauseTimeout will fire in this same reconcile, pause the sandbox,
-	// and extend ShutdownTime.
-	// We only skip when pauseTimeReached so that handlePauseTimeout can
-	// actually act in the same loop. If PauseTime is nil or still in the
-	// future, we must proceed with deletion.
+	// When paused retention is managed by the one-shot PauseTime path, allow a
+	// due pause to run before deletion so it can extend ShutdownTime. This
+	// deferral is bounded because handlePauseTimeout executes in the same
+	// reconcile, whether or not an AutoPausePolicy is also configured.
 	if _, hasRetention := box.Annotations[agentsv1alpha1.AnnotationReservePausedSandboxDuration]; hasRetention &&
 		!box.Spec.Paused &&
+		box.Spec.PauseTime != nil &&
 		pauseTimeReached(box.Spec.PauseTime, now) {
 		return false, nil
 	}

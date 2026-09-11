@@ -26,9 +26,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/signal"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -56,6 +56,7 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
+	"github.com/openkruise/agents/pkg/utils/network"
 	utilruntime "github.com/openkruise/agents/pkg/utils/runtime"
 	"github.com/openkruise/agents/pkg/utils/testutils"
 )
@@ -84,11 +85,11 @@ func CreateSandboxWithStatus(t *testing.T, c ctrlclient.Client, sbx *agentsv1alp
 }
 
 func Setup(t *testing.T) (*Controller, ctrlclient.Client, func()) {
-	return SetupWithMinResumeTimeout(t, models.DefaultMinResumeTimeoutSeconds)
+	return setupWithQuota(t, nil)
 }
 
 func SetupWithQuota(t *testing.T, enforcer sandboxmanager.QuotaEnforcer) (*Controller, ctrlclient.Client, func()) {
-	return setupWithMinResumeTimeoutAndQuota(t, models.DefaultMinResumeTimeoutSeconds, enforcer)
+	return setupWithQuota(t, enforcer)
 }
 
 func refreshKeyStorageForTest(t *testing.T, controller *Controller) {
@@ -105,6 +106,7 @@ func TestNewController(t *testing.T) {
 	mgrOpts := config.SandboxManagerOptions{
 		SystemNamespace:       "sandbox-system",
 		PeerSelector:          "component=sandbox-manager",
+		BindAddress:           "10.0.0.2",
 		SandboxNamespace:      "sandboxes",
 		SandboxLabelSelector:  "app=sandbox",
 		MaxClaimWorkers:       7,
@@ -124,7 +126,6 @@ func TestNewController(t *testing.T) {
 				Domain:           "example.com",
 				Port:             8080,
 				MaxTimeout:       3600,
-				MinResumeTimeout: 30,
 				KeyConfig:        keyCfg,
 				Manager:          mgrOpts,
 				RuntimeTLSBundle: bundle,
@@ -134,15 +135,29 @@ func TestNewController(t *testing.T) {
 			name: "zero options leave auth and runtime TLS disabled",
 			opts: ControllerOptions{},
 		},
+		{
+			name: "dedicated metrics port",
+			opts: ControllerOptions{
+				Port:        8080,
+				MetricsPort: 9090,
+			},
+		},
+		{
+			name: "equal metrics port reuses API listener",
+			opts: ControllerOptions{
+				Port:        8080,
+				MetricsPort: 8080,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sc := NewController(tt.opts)
 			require.NotNil(t, sc)
+			sc.registerRoutes()
 
 			assert.Equal(t, tt.opts.Domain, sc.domain)
 			assert.Equal(t, tt.opts.MaxTimeout, sc.maxTimeout)
-			assert.Equal(t, tt.opts.MinResumeTimeout, sc.minResumeTimeoutValue)
 			assert.Equal(t, tt.opts.KeyConfig, sc.keyCfg)
 			assert.Equal(t, tt.opts.RuntimeTLSBundle, sc.runtimeTLSBundle)
 			// The manager options are handed to the sandbox-manager builder
@@ -151,18 +166,42 @@ func TestNewController(t *testing.T) {
 
 			// Port is not retained as a field; it only shapes the server address.
 			require.NotNil(t, sc.server)
-			assert.Equal(t, fmt.Sprintf(":%d", tt.opts.Port), sc.server.Addr)
+			assert.Equal(t, network.ListenAddress(tt.opts.Manager.BindAddress, tt.opts.Port), sc.server.Addr)
+			if tt.opts.Manager.BindAddress != "" {
+				assert.Equal(t, fmt.Sprintf("%s:%d", tt.opts.Manager.BindAddress, tt.opts.Port), sc.adapter.Entry())
+			}
 			assert.NotNil(t, sc.mux)
 			assert.NotNil(t, sc.adapter)
+
+			status := func(h http.Handler, path string) int {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+				return rec.Code
+			}
+			// /health always stays on the control API listener.
+			assert.Equal(t, http.StatusOK, status(sc.mux, "/health"))
+			assert.Equal(t, http.StatusOK, status(sc.mux, "/kruise/api/health"))
+			if tt.opts.MetricsPort > 0 && tt.opts.MetricsPort != tt.opts.Port {
+				require.NotNil(t, sc.metricsServer)
+				assert.Equal(t, fmt.Sprintf(":%d", tt.opts.MetricsPort), sc.metricsServer.Addr)
+				assert.Equal(t, http.StatusNotFound, status(sc.mux, "/metrics"))
+				assert.Equal(t, http.StatusOK, status(sc.metricsServer.Handler, "/metrics"))
+				assert.Equal(t, http.StatusNotFound, status(sc.metricsServer.Handler, "/health"))
+				assert.Equal(t, http.StatusNotFound, status(sc.metricsServer.Handler, "/kruise/api/health"))
+			} else {
+				assert.Nil(t, sc.metricsServer)
+				assert.Equal(t, http.StatusOK, status(sc.mux, "/metrics"))
+			}
 		})
 	}
 }
 
-func SetupWithMinResumeTimeout(t *testing.T, minResumeTimeout int) (*Controller, ctrlclient.Client, func()) {
-	return setupWithMinResumeTimeoutAndQuota(t, minResumeTimeout, nil)
+func SetupWithMinResumeTimeout(t *testing.T, _ int) (*Controller, ctrlclient.Client, func()) {
+	return setupWithQuota(t, nil)
 }
 
-func setupWithMinResumeTimeoutAndQuota(t *testing.T, minResumeTimeout int, quotaEnforcer sandboxmanager.QuotaEnforcer) (*Controller, ctrlclient.Client, func()) {
+func setupWithQuota(t *testing.T, quotaEnforcer sandboxmanager.QuotaEnforcer) (*Controller, ctrlclient.Client, func()) {
 	testutils.InitLogOutput()
 	namespace := "sandbox-system"
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -180,10 +219,9 @@ func setupWithMinResumeTimeoutAndQuota(t *testing.T, minResumeTimeout int, quota
 	ctrlMgrOpts := opts
 	ctrlMgrOpts.PeerSelector = "component=sandbox-manager"
 	controller := NewController(ControllerOptions{
-		Domain:           "example.com",
-		Port:             TestServerPort,
-		MaxTimeout:       models.DefaultMaxTimeout,
-		MinResumeTimeout: minResumeTimeout,
+		Domain:     "example.com",
+		Port:       TestServerPort,
+		MaxTimeout: models.DefaultMaxTimeout,
 		KeyConfig: &keys.Config{
 			Mode:      keys.StorageModeSecret,
 			Namespace: namespace,
@@ -253,8 +291,6 @@ func setupWithMinResumeTimeoutAndQuota(t *testing.T, minResumeTimeout int, quota
 		}
 	}
 
-	controller.stop = make(chan os.Signal, 1)
-	signal.Notify(controller.stop, syscall.SIGINT, syscall.SIGTERM)
 	serverErr := make(chan error, 1)
 	go func() {
 		if err := controller.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -266,7 +302,6 @@ func setupWithMinResumeTimeoutAndQuota(t *testing.T, minResumeTimeout int, quota
 
 	return controller, fc, func() {
 		t.Helper()
-		signal.Stop(controller.stop)
 		_ = controller.server.Close()
 		require.NoError(t, <-serverErr)
 	}
@@ -297,139 +332,261 @@ func TestNewControllerPropagatesShortSandboxIDOption(t *testing.T) {
 	}
 }
 
-type stopProbeInfraBuilder struct {
+// hookInfraBuilder builds hookInfra around a real sandboxcr infra.
+type hookInfraBuilder struct {
 	base infra.Builder
+	run  func(context.Context) error
 	stop func()
 }
 
-func (b stopProbeInfraBuilder) Build() infra.Infrastructure {
-	return stopProbeInfra{Infrastructure: b.base.Build(), stop: b.stop}
+func (b hookInfraBuilder) Build() infra.Infrastructure {
+	return hookInfra{Infrastructure: b.base.Build(), run: b.run, stop: b.stop}
 }
 
-type stopProbeInfra struct {
+// hookInfra lets tests replace Run and observe Stop on an otherwise real
+// Infrastructure; its route source never emits events.
+type hookInfra struct {
 	infra.Infrastructure
+	run  func(context.Context) error
 	stop func()
 }
 
-func (i stopProbeInfra) Stop(ctx context.Context) {
-	i.stop()
+func (i hookInfra) Run(ctx context.Context) error {
+	if i.run != nil {
+		return i.run(ctx)
+	}
+	return i.Infrastructure.Run(ctx)
+}
+
+func (i hookInfra) Stop(ctx context.Context) {
+	if i.stop != nil {
+		i.stop()
+	}
 	i.Infrastructure.Stop(ctx)
 }
 
-func TestControllerShutdownStopsManagerAfterHTTPShutdown(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
+func (hookInfra) GetSandboxRouteSource() infra.SandboxRouteSource {
+	return noOpSandboxRouteSource{}
+}
 
-	requestStarted := make(chan struct{})
-	releaseRequest := make(chan struct{})
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			close(requestStarted)
-			<-releaseRequest
-			_, _ = w.Write([]byte("ok"))
-		}),
-	}
-	shutdownStarted := make(chan struct{})
-	server.RegisterOnShutdown(func() {
-		close(shutdownStarted)
-	})
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- server.Serve(listener)
-	}()
+type noOpSandboxRouteSource struct{}
 
-	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: &http.Transport{Proxy: nil},
-	}
-	defer client.CloseIdleConnections()
-	clientErr := make(chan error, 1)
-	go func() {
-		resp, err := client.Get("http://" + listener.Addr().String())
-		if err != nil {
-			clientErr <- err
-			return
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		clientErr <- resp.Body.Close()
-	}()
+func (noOpSandboxRouteSource) Subscribe(context.Context, infra.SandboxRouteEventHandler) error {
+	return nil
+}
 
-	select {
-	case <-requestStarted:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for request to start")
-	}
-
-	cancelCalled := atomic.Bool{}
-	managerStopped := make(chan struct{})
-
+func newStopProbeManager(t *testing.T, stop func()) *sandboxmanager.SandboxManager {
+	t.Helper()
 	opts := config.InitOptions(config.SandboxManagerOptions{
 		SystemNamespace:    "sandbox-system",
 		MemberlistBindPort: config.DefaultMemberlistBindPort,
 	})
-	fakeCache, fc, cacheErr := cachetest.NewTestCache(t)
-	require.NoError(t, cacheErr)
+	fakeCache, fc, err := cachetest.NewTestCache(t)
+	require.NoError(t, err)
 	proxyServer := proxy.NewServer(opts)
 	mgr, err := sandboxmanager.NewSandboxManagerBuilder(opts).
 		WithCustomInfra(func() (infra.Builder, error) {
-			builder := sandboxcr.NewInfraBuilder(opts).
-				WithCache(fakeCache).
-				WithAPIReader(fc).
-				WithRouteReader(proxyServer)
-			return stopProbeInfraBuilder{
-				base: builder,
-				stop: func() {
-					close(managerStopped)
-				},
+			return hookInfraBuilder{
+				base: sandboxcr.NewInfraBuilder(opts).
+					WithCache(fakeCache).
+					WithAPIReader(fc).
+					WithRouteReader(proxyServer),
+				stop: stop,
 			}, nil
 		}).
 		Build()
 	require.NoError(t, err)
+	return mgr
+}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer shutdownCancel()
-	shutdownDone := make(chan struct{})
-	sc := &Controller{
-		server:  server,
-		manager: mgr,
+func TestControllerRunStartsDedicatedObservabilityListener(t *testing.T) {
+	sc := NewController(ControllerOptions{Port: 8080, MetricsPort: 9090})
+	sc.registerRoutes()
+	sc.manager = newStopProbeManager(t, func() {})
+
+	apiAddr := make(chan string, 1)
+	metricsAddr := make(chan string, 1)
+	sc.server.Addr = "127.0.0.1:0"
+	sc.server.BaseContext = func(listener net.Listener) context.Context {
+		apiAddr <- listener.Addr().String()
+		return context.Background()
 	}
-	go func() {
-		sc.shutdown(shutdownCtx, func() {
-			cancelCalled.Store(true)
+	sc.metricsServer.Addr = "127.0.0.1:0"
+	sc.metricsServer.BaseContext = func(listener net.Listener) context.Context {
+		metricsAddr <- listener.Addr().String()
+		return context.Background()
+	}
+
+	stop := make(chan os.Signal, 1)
+	runCtx, err := sc.Run(stop)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		select {
+		case stop <- syscall.SIGTERM:
+		case <-runCtx.Done():
+		}
+		select {
+		case <-runCtx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("timed out waiting for controller shutdown")
+		}
+	})
+
+	waitAddr := func(name string, ch <-chan string) string {
+		t.Helper()
+		select {
+		case addr := <-ch:
+			return addr
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s listener", name)
+			return ""
+		}
+	}
+	controlAddr := waitAddr("control API", apiAddr)
+	observabilityAddr := waitAddr("observability", metricsAddr)
+
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	t.Cleanup(client.CloseIdleConnections)
+	status := func(addr, path string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+		require.NoError(t, err)
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return resp.StatusCode
+	}
+
+	assert.Equal(t, http.StatusOK, status(controlAddr, "/health"))
+	assert.Equal(t, http.StatusOK, status(controlAddr, "/kruise/api/health"))
+	assert.Equal(t, http.StatusNotFound, status(controlAddr, "/metrics"))
+	assert.Equal(t, http.StatusNotFound, status(observabilityAddr, "/health"))
+	assert.Equal(t, http.StatusNotFound, status(observabilityAddr, "/kruise/api/health"))
+	assert.Equal(t, http.StatusOK, status(observabilityAddr, "/metrics"))
+	assert.Equal(t, http.StatusMethodNotAllowed, status(controlAddr, "/sandboxes"))
+	assert.Equal(t, http.StatusNotFound, status(observabilityAddr, "/sandboxes"))
+}
+
+func TestControllerShutdownStopsManagerAfterHTTPShutdown(t *testing.T) {
+	tests := []struct {
+		name        string
+		withMetrics bool
+	}{
+		{name: "api listener only"},
+		{name: "api and metrics listeners", withMetrics: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &http.Client{
+				Timeout:   5 * time.Second,
+				Transport: &http.Transport{Proxy: nil},
+			}
+			t.Cleanup(client.CloseIdleConnections)
+
+			type liveServer struct {
+				server    *http.Server
+				release   chan struct{}
+				onStop    chan struct{}
+				clientErr chan error
+				serveErr  chan error
+			}
+			start := func() *liveServer {
+				t.Helper()
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, err)
+				s := &liveServer{
+					release:   make(chan struct{}),
+					onStop:    make(chan struct{}),
+					clientErr: make(chan error, 1),
+					serveErr:  make(chan error, 1),
+				}
+				started := make(chan struct{})
+				s.server = &http.Server{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						close(started)
+						<-s.release
+						_, _ = w.Write([]byte("ok"))
+					}),
+				}
+				s.server.RegisterOnShutdown(func() { close(s.onStop) })
+				go func() { s.serveErr <- s.server.Serve(ln) }()
+				go func() {
+					resp, err := client.Get("http://" + ln.Addr().String())
+					if err != nil {
+						s.clientErr <- err
+						return
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					s.clientErr <- resp.Body.Close()
+				}()
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for request to start")
+				}
+				return s
+			}
+
+			api := start()
+			sc := &Controller{server: api.server}
+			servers := []*liveServer{api}
+			if tt.withMetrics {
+				metrics := start()
+				sc.metricsServer = metrics.server
+				servers = append(servers, metrics)
+			}
+
+			cancelCalled := atomic.Bool{}
+			managerStopped := make(chan struct{})
+			sc.manager = newStopProbeManager(t, func() { close(managerStopped) })
+
+			shutdownCtx, shutdownCancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer shutdownCancel()
+			shutdownDone := make(chan struct{})
+			go func() {
+				sc.shutdown(shutdownCtx, func() { cancelCalled.Store(true) })
+				close(shutdownDone)
+			}()
+
+			for _, s := range servers {
+				select {
+				case <-s.onStop:
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for HTTP shutdown to start")
+				}
+			}
+			for _, s := range servers[:len(servers)-1] {
+				close(s.release)
+			}
+			select {
+			case <-managerStopped:
+				t.Fatal("manager.Stop must not run while HTTP requests are draining")
+			case <-shutdownDone:
+				t.Fatal("shutdown completed before the active request drained")
+			case <-time.After(50 * time.Millisecond):
+			}
+			assert.False(t, cancelCalled.Load(), "server context must remain active while HTTP requests drain")
+
+			close(servers[len(servers)-1].release)
+			select {
+			case <-shutdownDone:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for shutdown to finish")
+			}
+			select {
+			case <-managerStopped:
+			default:
+				t.Fatal("manager.Stop must run after HTTP requests drain")
+			}
+			for _, s := range servers {
+				require.NoError(t, <-s.clientErr)
+				require.ErrorIs(t, <-s.serveErr, http.ErrServerClosed)
+			}
+			assert.True(t, cancelCalled.Load())
 		})
-		close(shutdownDone)
-	}()
-
-	select {
-	case <-shutdownStarted:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for HTTP shutdown to start")
 	}
-	select {
-	case <-managerStopped:
-		t.Fatal("manager.Stop must not run while HTTP requests are draining")
-	default:
-	}
-	select {
-	case <-shutdownDone:
-		t.Fatal("shutdown completed before the active request drained")
-	default:
-	}
-
-	close(releaseRequest)
-	select {
-	case <-shutdownDone:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for shutdown to finish")
-	}
-	select {
-	case <-managerStopped:
-	default:
-		t.Fatal("manager.Stop must run after HTTP requests drain")
-	}
-	require.NoError(t, <-clientErr)
-	require.ErrorIs(t, <-serverErr, http.ErrServerClosed)
-	assert.True(t, cancelCalled.Load())
 }
 
 func NewRequest(t *testing.T, query map[string]string, body any, pathValues map[string]string, user *models.CreatedTeamAPIKey) *http.Request {
@@ -454,7 +611,7 @@ func NewRequest(t *testing.T, query map[string]string, body any, pathValues map[
 			req.SetPathValue(k, v)
 		}
 	}
-	return req.WithContext(context.WithValue(req.Context(), "user", user))
+	return req.WithContext(context.WithValue(req.Context(), userContextKey, user))
 }
 
 func GetSbsOwnerReference(sbs *agentsv1alpha1.SandboxSet) []metav1.OwnerReference {

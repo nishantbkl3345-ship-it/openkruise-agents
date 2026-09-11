@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/autopause"
 	webhookutils "github.com/openkruise/agents/pkg/webhook/utils"
 )
 
@@ -90,6 +91,11 @@ func validateLabelsAndAnnotations(metadata metav1.ObjectMeta, fldPath *field.Pat
 
 func validateSandboxTemplateSpec(spec agentsv1alpha1.SandboxTemplateSpec, fldPath *field.Path) field.ErrorList {
 	var errList field.ErrorList
+	errList = append(errList, autopause.ValidateProbes(spec.Probes, fldPath.Child("probes"))...)
+	errList = append(errList, autopause.ValidateAutoPausePolicy(spec.AutoPausePolicy, spec.Probes, fldPath.Child("autoPausePolicy"))...)
+	if spec.Template == nil {
+		return append(errList, field.Required(fldPath.Child("template"), "template is required"))
+	}
 	errList = append(errList, validateLabelsAndAnnotations(spec.Template.ObjectMeta, fldPath.Child("template"))...)
 	errList = append(errList, validateSandboxPodTemplateSpec(spec, fldPath)...)
 	return errList
@@ -97,8 +103,13 @@ func validateSandboxTemplateSpec(spec agentsv1alpha1.SandboxTemplateSpec, fldPat
 
 func validateSandboxPodTemplateSpec(spec agentsv1alpha1.SandboxTemplateSpec, fldPath *field.Path) field.ErrorList {
 	errList := field.ErrorList{}
+	template := spec.Template.DeepCopy()
 	coreTemplate := &core.PodTemplateSpec{}
-	if err := corev1.Convert_v1_PodTemplateSpec_To_core_PodTemplateSpec(spec.Template.DeepCopy(), coreTemplate, nil); err != nil {
+	if len(spec.VolumeClaimTemplates) != 0 {
+		errList = append(errList, webhookutils.ValidateVolumeClaimTemplateMounts(spec.Template, spec.VolumeClaimTemplates, fldPath)...)
+		webhookutils.AppendVolumeClaimTemplateVolumes(template, spec.VolumeClaimTemplates)
+	}
+	if err := corev1.Convert_v1_PodTemplateSpec_To_core_PodTemplateSpec(template, coreTemplate, nil); err != nil {
 		errList = append(errList, field.Invalid(fldPath.Child("template"), spec.Template, fmt.Sprintf("Convert_v1_PodTemplateSpec_To_core_PodTemplateSpec failed: %v", err)))
 		return errList
 	}

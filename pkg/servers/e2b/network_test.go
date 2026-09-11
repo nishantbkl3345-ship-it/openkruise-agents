@@ -380,6 +380,18 @@ func TestValidateAndBuildNetworkConfig(t *testing.T) {
 			wantNil:     true,
 			expectError: "denyOut list exceeds maximum",
 		},
+		{
+			name: "rules-only network config is kept, not nilled",
+			network: &models.SandboxNetworkConfig{
+				Rules: map[string][]models.SandboxNetworkRule{
+					"api.example.com": {{Transform: &models.SandboxNetworkTransform{
+						Headers: map[string]string{"X-A": "1"},
+					}}},
+				},
+			},
+			wantNil:     false,
+			expectError: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -416,7 +428,7 @@ func TestUpdateSandboxNetwork_InvalidBody(t *testing.T) {
 		strings.NewReader("invalid json"))
 	require.NoError(t, err)
 	req.SetPathValue("sandboxID", "non-existent--sandbox")
-	req = req.WithContext(context.WithValue(req.Context(), "user", user))
+	req = req.WithContext(context.WithValue(req.Context(), userContextKey, user))
 
 	resp, apiErr := controller.UpdateSandboxNetwork(req)
 	require.NotNil(t, apiErr)

@@ -1964,3 +1964,124 @@ func TestIsLiveForQuota(t *testing.T) {
 		})
 	}
 }
+
+func sandboxWithResume(pause *agentsv1alpha1.PausePolicy, resume *agentsv1alpha1.ResumePolicy) *agentsv1alpha1.Sandbox {
+	if pause == nil && resume == nil {
+		return &agentsv1alpha1.Sandbox{}
+	}
+	return &agentsv1alpha1.Sandbox{
+		Spec: agentsv1alpha1.SandboxSpec{
+			AutoPausePolicy: &agentsv1alpha1.AutoPausePolicy{
+				Pause:  pause,
+				Resume: resume,
+			},
+		},
+	}
+}
+
+func TestWakeOnIngressTraffic(t *testing.T) {
+	tests := []struct {
+		name        string
+		sandbox     *agentsv1alpha1.Sandbox
+		wantEnabled bool
+		wantTimeout time.Duration
+	}{
+		{
+			name:        "nil sandbox",
+			sandbox:     nil,
+			wantEnabled: false,
+		},
+		{
+			name:        "no auto-pause policy",
+			sandbox:     &agentsv1alpha1.Sandbox{},
+			wantEnabled: false,
+		},
+		{
+			name:        "pause rule only",
+			sandbox:     sandboxWithResume(&agentsv1alpha1.PausePolicy{WhenProbedIdleState: &agentsv1alpha1.ProbedIdleStateRule{Probe: "idle"}}, nil),
+			wantEnabled: false,
+		},
+		{
+			name:        "probed schedule rule only",
+			sandbox:     sandboxWithResume(nil, &agentsv1alpha1.ResumePolicy{WhenProbedScheduleTime: &agentsv1alpha1.ProbedScheduleTimeRule{Probe: "sched"}}),
+			wantEnabled: false,
+		},
+		{
+			name:        "ingress traffic rule without pause timeout",
+			sandbox:     sandboxWithResume(nil, &agentsv1alpha1.ResumePolicy{OnIngressTraffic: &agentsv1alpha1.IngressTrafficRule{}}),
+			wantEnabled: true,
+		},
+		{
+			name: "ingress traffic rule with pause timeout",
+			sandbox: sandboxWithResume(nil, &agentsv1alpha1.ResumePolicy{OnIngressTraffic: &agentsv1alpha1.IngressTrafficRule{
+				PauseTimeout: &metav1.Duration{Duration: 5 * time.Minute},
+			}}),
+			wantEnabled: true,
+			wantTimeout: 5 * time.Minute,
+		},
+		{
+			name: "ingress traffic rule with non-positive pause timeout",
+			sandbox: sandboxWithResume(nil, &agentsv1alpha1.ResumePolicy{OnIngressTraffic: &agentsv1alpha1.IngressTrafficRule{
+				PauseTimeout: &metav1.Duration{Duration: -time.Second},
+			}}),
+			wantEnabled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantEnabled, WakeOnIngressTrafficEnabled(tt.sandbox))
+			assert.Equal(t, tt.wantTimeout, WakeOnIngressTrafficPauseTimeout(tt.sandbox))
+		})
+	}
+}
+
+func TestIsSandboxStartupFailureReason(t *testing.T) {
+	tests := []struct {
+		name        string
+		reason      string
+		wantFailure bool
+	}{
+		{
+			name:        "start container failed",
+			reason:      agentsv1alpha1.SandboxReadyReasonStartContainerFailed,
+			wantFailure: true,
+		},
+		{
+			name:        "pod create failed",
+			reason:      agentsv1alpha1.SandboxReadyReasonPodCreateFailed,
+			wantFailure: true,
+		},
+		{
+			name:        "unschedulable",
+			reason:      agentsv1alpha1.SandboxReadyReasonUnschedulable,
+			wantFailure: true,
+		},
+		{
+			name:        "pod ready",
+			reason:      agentsv1alpha1.SandboxReadyReasonPodReady,
+			wantFailure: false,
+		},
+		{
+			name:        "upgrading",
+			reason:      agentsv1alpha1.SandboxReadyReasonUpgrading,
+			wantFailure: false,
+		},
+		{
+			name:        "unknown reason",
+			reason:      "SomethingElse",
+			wantFailure: false,
+		},
+		{
+			name:        "empty reason",
+			reason:      "",
+			wantFailure: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantFailure, IsSandboxStartupFailureReason(tt.reason))
+		})
+	}
+}

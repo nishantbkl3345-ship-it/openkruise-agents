@@ -34,9 +34,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openkruise/agents/api/v1alpha1"
@@ -49,6 +51,7 @@ import (
 	quotaspec "github.com/openkruise/agents/pkg/sandbox-manager/quota/spec"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
 	"github.com/openkruise/agents/pkg/servers/web"
+	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/csiutils"
 )
 
@@ -395,6 +398,52 @@ func TestCreateSandboxWithClaim_CSIMount(t *testing.T) {
 			expectCSIMount:     true,
 			expectedMountCount: 1,
 		},
+		{
+			name: "csi mount with bucketSpace attribute for AgenticBucket",
+			request: models.NewSandboxRequest{
+				TemplateID: "test-template",
+				Extensions: models.NewSandboxRequestExtension{
+					CSIMount: models.CSIMountExtension{
+						MountConfigs: []v1alpha1.CSIMountConfig{
+							{
+								PvName:    "pv-oss-agentic",
+								MountPath: "/data",
+								Attributes: map[string]string{
+									"credentialProviderName": "oss-bs-rw",
+									"bucketSpace":            "my-space-xxx-bs-apsr",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectCSIMount:     true,
+			expectedMountCount: 1,
+		},
+		{
+			name: "csi mount with bucketSpacePrefix and region for AgenticBucket",
+			request: models.NewSandboxRequest{
+				TemplateID: "test-template",
+				Extensions: models.NewSandboxRequestExtension{
+					CSIMount: models.CSIMountExtension{
+						MountConfigs: []v1alpha1.CSIMountConfig{
+							{
+								PvName:    "pv-oss-agentic",
+								MountPath: "/data",
+								SubPath:   "user-data",
+								Attributes: map[string]string{
+									"credentialProviderName": "oss-bs-rw",
+									"bucketSpacePrefix":      "sandbox-a",
+									"region":                 "cn-hangzhou",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectCSIMount:     true,
+			expectedMountCount: 1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -573,21 +622,48 @@ func TestCreateSandboxWithClaim_NamingExtensionRejected(t *testing.T) {
 }
 
 func TestCreateSandboxWithClone_InplaceUpdateRejected(t *testing.T) {
-	ctrl := &Controller{}
-	request := models.NewSandboxRequest{
-		TemplateID: "test-checkpoint",
-		Extensions: models.NewSandboxRequestExtension{
-			InplaceUpdate: models.InplaceUpdateExtension{
+	tests := []struct {
+		name        string
+		inplace     models.InplaceUpdateExtension
+		expectError string
+	}{
+		{
+			name: "image update rejected",
+			inplace: models.InplaceUpdateExtension{
 				Image: "nginx:latest",
 			},
+			expectError: "InplaceUpdate is not supported for clone",
+		},
+		{
+			name: "memory resize rejected",
+			inplace: models.InplaceUpdateExtension{
+				Resources: &models.InplaceUpdateResourcesExtension{
+					Requests: corev1.ResourceList{
+						corev1.ResourceMemory: resource.MustParse("512Mi"),
+					},
+				},
+			},
+			expectError: "InplaceUpdate is not supported for clone",
 		},
 	}
-	user := &models.CreatedTeamAPIKey{ID: uuid.New(), Name: "test-user"}
 
-	_, apiErr := ctrl.createSandboxWithClone(context.Background(), request, user, "")
-	require.NotNil(t, apiErr)
-	assert.Equal(t, http.StatusBadRequest, apiErr.Code)
-	assert.Contains(t, apiErr.Message, "InplaceUpdate is not supported for clone")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &Controller{}
+			request := models.NewSandboxRequest{
+				TemplateID: "test-checkpoint",
+				Extensions: models.NewSandboxRequestExtension{
+					InplaceUpdate: tt.inplace,
+				},
+			}
+			user := &models.CreatedTeamAPIKey{ID: uuid.New(), Name: "test-user"}
+
+			_, apiErr := ctrl.createSandboxWithClone(context.Background(), request, user, "")
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadRequest, apiErr.Code)
+			assert.Contains(t, apiErr.Message, tt.expectError)
+		})
+	}
 }
 
 // TestCreateSandboxWithClone_Naming asserts that Extensions.Name and
@@ -786,6 +862,25 @@ func TestParseCreateSandboxRequest(t *testing.T) {
 		assert.Equal(t, "/models", got.Extensions.CSIMount.MountConfigs[1].MountPath)
 	})
 
+	t.Run("autoResume parsed from JSON body", func(t *testing.T) {
+		body := `{
+			"templateID":"t1",
+			"autoResume":{"enabled":true}
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+		got, apiErr := ctrl.parseCreateSandboxRequest(req)
+		require.Nil(t, apiErr)
+		assert.True(t, got.AutoResume.Enabled)
+	})
+
+	t.Run("autoResume absent defaults to disabled", func(t *testing.T) {
+		body := `{"templateID":"t1"}`
+		req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+		got, apiErr := ctrl.parseCreateSandboxRequest(req)
+		require.Nil(t, apiErr)
+		assert.False(t, got.AutoResume.Enabled)
+	})
+
 	t.Run("volumeMounts with empty name", func(t *testing.T) {
 		body := `{
 			"templateID":"t1",
@@ -894,6 +989,201 @@ func TestParseCreateSandboxRequest(t *testing.T) {
 	})
 }
 
+func TestBasicSandboxCreateModifier(t *testing.T) {
+	tests := []struct {
+		name                   string
+		request                models.NewSandboxRequest
+		initialAnnotations     map[string]string
+		initialLabels          map[string]string
+		initialWakeRule        *agentsv1alpha1.IngressTrafficRule
+		maxTimeout             int
+		expectAnnotations      map[string]string
+		expectNoAnnotations    []string
+		expectLabels           map[string]string
+		expectWakeRule         bool
+		expectWakePauseTimeout time.Duration
+	}{
+		{
+			name: "metadata propagated to annotations",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				Metadata:   map[string]string{"user-key": "user-val"},
+			},
+			maxTimeout:        3600,
+			expectAnnotations: map[string]string{"user-key": "user-val"},
+		},
+		{
+			name: "returnPodIP extension sets annotation",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				Extensions: models.NewSandboxRequestExtension{ReturnPodIP: true},
+			},
+			maxTimeout: 3600,
+			expectAnnotations: map[string]string{
+				models.ExtensionKeyReturnPodIP: agentsv1alpha1.True,
+			},
+		},
+		{
+			name: "labels propagated from extensions",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				Extensions: models.NewSandboxRequestExtension{
+					Labels: map[string]string{"env": "test"},
+				},
+			},
+			maxTimeout:   3600,
+			expectLabels: map[string]string{"env": "test"},
+		},
+		{
+			// Auto-pause sandboxes get the request timeout as the wake rule's
+			// PauseTimeout, so a traffic wake re-arms auto-pause with it.
+			name: "autoResume enabled sets wake rule with request timeout",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				AutoPause:  true,
+				AutoResume: models.SandboxAutoResumeConfig{Enabled: true},
+			},
+			maxTimeout:             3600,
+			expectWakeRule:         true,
+			expectWakePauseTimeout: 300 * time.Second,
+		},
+		{
+			// Never-timeout sandboxes never carry a PauseTime, so the wake
+			// rule gets no PauseTimeout and a wake must not re-arm auto-pause.
+			name: "autoResume enabled never-timeout sets wake rule without pause timeout",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				AutoPause:  true,
+				AutoResume: models.SandboxAutoResumeConfig{Enabled: true},
+				Extensions: models.NewSandboxRequestExtension{NeverTimeout: true},
+			},
+			maxTimeout:     3600,
+			expectWakeRule: true,
+		},
+		{
+			// A recycled CR can still carry the wake rule of delivery A;
+			// delivery B's request decides the policy, so the stale rule is
+			// replaced by a new rule carrying B's request timeout.
+			name: "autoResume enabled replaces stale inherited wake rule",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				AutoPause:  true,
+				AutoResume: models.SandboxAutoResumeConfig{Enabled: true},
+			},
+			initialWakeRule: &agentsv1alpha1.IngressTrafficRule{
+				PauseTimeout: &metav1.Duration{Duration: 999 * time.Second},
+			},
+			maxTimeout:             3600,
+			expectWakeRule:         true,
+			expectWakePauseTimeout: 300 * time.Second,
+		},
+		{
+			// Shutdown-only lifecycle: the wake rule applies regardless; the
+			// gateway never injects a PauseTime into non-auto-pause sandboxes,
+			// so the rule gets no PauseTimeout.
+			name: "autoResume enabled without auto-pause sets wake rule",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				AutoPause:  false,
+				AutoResume: models.SandboxAutoResumeConfig{Enabled: true},
+			},
+			initialWakeRule: &agentsv1alpha1.IngressTrafficRule{
+				PauseTimeout: &metav1.Duration{Duration: 999 * time.Second},
+			},
+			maxTimeout:     3600,
+			expectWakeRule: true,
+		},
+		{
+			name: "autoResume disabled clears wake rule",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				AutoResume: models.SandboxAutoResumeConfig{Enabled: false},
+			},
+			maxTimeout: 3600,
+		},
+		{
+			// Delivery A enabled autoResume; the CR was recycled and claimed
+			// by delivery B without autoResume. The inherited wake rule must
+			// be cleared so B cannot be woken by traffic.
+			name: "autoResume disabled clears inherited wake rule",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+				AutoResume: models.SandboxAutoResumeConfig{Enabled: false},
+			},
+			initialWakeRule: &agentsv1alpha1.IngressTrafficRule{
+				PauseTimeout: &metav1.Duration{Duration: 300 * time.Second},
+			},
+			maxTimeout: 3600,
+		},
+		{
+			name: "autoResume absent clears wake rule",
+			request: models.NewSandboxRequest{
+				TemplateID: "t1",
+				Timeout:    300,
+			},
+			maxTimeout: 3600,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSbx := &sandboxcr.Sandbox{
+				Sandbox: &agentsv1alpha1.Sandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test-sandbox",
+						Namespace:   "default",
+						Annotations: tt.initialAnnotations,
+						Labels:      tt.initialLabels,
+					},
+				},
+			}
+			if tt.initialWakeRule != nil {
+				mockSbx.Spec.AutoPausePolicy = &agentsv1alpha1.AutoPausePolicy{
+					Resume: &agentsv1alpha1.ResumePolicy{
+						OnIngressTraffic: tt.initialWakeRule,
+					},
+				}
+			}
+
+			c := &Controller{maxTimeout: tt.maxTimeout}
+			c.basicSandboxCreateModifier(context.Background(), mockSbx, tt.request)
+
+			annotations := mockSbx.GetAnnotations()
+			for k, v := range tt.expectAnnotations {
+				got, ok := annotations[k]
+				assert.True(t, ok, "expected annotation %q to exist", k)
+				assert.Equal(t, v, got, "annotation %q value mismatch", k)
+			}
+			for _, k := range tt.expectNoAnnotations {
+				_, ok := annotations[k]
+				assert.False(t, ok, "expected annotation %q to NOT exist", k)
+			}
+
+			labels := mockSbx.GetLabels()
+			for k, v := range tt.expectLabels {
+				got, ok := labels[k]
+				assert.True(t, ok, "expected label %q to exist", k)
+				assert.Equal(t, v, got, "label %q value mismatch", k)
+			}
+
+			assert.Equal(t, tt.expectWakeRule, utils.WakeOnIngressTrafficEnabled(mockSbx.Sandbox))
+			if tt.expectWakeRule {
+				assert.Equal(t, tt.expectWakePauseTimeout, utils.WakeOnIngressTrafficPauseTimeout(mockSbx.Sandbox),
+					"the wake rule PauseTimeout must reflect the caller-provided value")
+			}
+		})
+	}
+}
+
 func TestMapInfraErrorToApiError(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -965,29 +1255,79 @@ func TestCreateSandbox_TopLevelMissingTemplateOrCheckpointReturns400(t *testing.
 	assert.Equal(t, int64(0), fakeQuota.acquireCalls.Load())
 }
 
-func TestCreateSandbox_MemoryOverrideRejectedBeforeQuotaAcquire(t *testing.T) {
+func TestCreateSandbox_MemoryOverridePropagatedToClaimedSandbox(t *testing.T) {
 	fakeQuota := &fakeQuotaManager{}
+	controller, client, teardown := SetupWithQuota(t, fakeQuota)
+	defer teardown()
 
-	apiErr := validateCreateResourceOverride(models.NewSandboxRequest{
-		TemplateID: "claim-template",
-		Extensions: models.NewSandboxRequestExtension{
-			InplaceUpdate: models.InplaceUpdateExtension{
-				Resources: &models.InplaceUpdateResourcesExtension{
-					Limits: corev1.ResourceList{
-						corev1.ResourceMemory: resource.MustParse("1024Mi"),
-					},
-				},
-			},
-		},
-		Metadata: map[string]string{
-			models.ExtensionKeySkipInitRuntime: v1alpha1.True,
-		},
+	cleanup := CreateSandboxPool(t, controller, "memory-override-tmpl", 1, CreateSandboxPoolOptions{
+		CPURequest: "100m",
+		Memory:     "128Mi",
 	})
+	defer cleanup()
+
+	user := quotaLimitedUser([]quotaspec.QuotaLimit{{
+		Dimension: quotaspec.DimSandboxCount,
+		Scope:     quotaspec.ScopeRunning,
+		Limit:     10,
+	}})
+	// Keep requests == limits so the resize preserves the pool's Guaranteed QoS
+	// class; a request/limit split would change QoS and be rejected.
+	resp, apiErr := controller.CreateSandbox(NewRequest(t, nil, models.NewSandboxRequest{
+		TemplateID: "memory-override-tmpl",
+		Metadata: map[string]string{
+			models.ExtensionKeySkipInitRuntime:        v1alpha1.True,
+			models.ExtensionKeyClaimWithMemoryRequest: "512Mi",
+			models.ExtensionKeyClaimWithMemoryLimit:   "512Mi",
+		},
+	}, nil, user))
+
+	require.Nil(t, apiErr)
+	require.Equal(t, http.StatusCreated, resp.Code)
+	require.NotNil(t, resp.Body)
+	// The request must proceed past request parsing into the claim flow, so
+	// quota acquisition happens exactly once (the old behavior rejected
+	// memory overrides before quota was ever acquired).
+	assert.Equal(t, int64(1), fakeQuota.acquireCalls.Load())
+
+	claimed := GetSandbox(t, resp.Body.SandboxID, client)
+	resources := claimed.Spec.Template.Spec.Containers[0].Resources
+	assert.Equal(t, resource.MustParse("512Mi"), resources.Requests[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("512Mi"), resources.Limits[corev1.ResourceMemory])
+	// Unrelated resources must be preserved by the memory override.
+	assert.Equal(t, resource.MustParse("100m"), resources.Requests[corev1.ResourceCPU])
+}
+
+func TestCreateSandbox_InvalidResourceOverrideReturns400(t *testing.T) {
+	fakeQuota := &fakeQuotaManager{}
+	controller, _, teardown := SetupWithQuota(t, fakeQuota)
+	defer teardown()
+
+	cleanup := CreateSandboxPool(t, controller, "invalid-override-tmpl", 1, CreateSandboxPoolOptions{
+		CPURequest: "100m",
+		Memory:     "256Mi",
+	})
+	defer cleanup()
+
+	user := quotaLimitedUser([]quotaspec.QuotaLimit{{
+		Dimension: quotaspec.DimSandboxCount,
+		Scope:     quotaspec.ScopeRunning,
+		Limit:     10,
+	}})
+	// A memory downscale is client input error and must map to HTTP 400,
+	// not 500, and must not lock or consume the pooled sandbox.
+	resp, apiErr := controller.CreateSandbox(NewRequest(t, nil, models.NewSandboxRequest{
+		TemplateID: "invalid-override-tmpl",
+		Metadata: map[string]string{
+			models.ExtensionKeySkipInitRuntime:        v1alpha1.True,
+			models.ExtensionKeyClaimWithMemoryRequest: "128Mi",
+		},
+	}, nil, user))
 
 	require.NotNil(t, apiErr)
 	assert.Equal(t, http.StatusBadRequest, apiErr.Code)
-	assert.Contains(t, apiErr.Message, "memory")
-	assert.Equal(t, int64(0), fakeQuota.acquireCalls.Load())
+	assert.Contains(t, apiErr.Message, "downscale")
+	assert.Zero(t, resp.Code)
 }
 
 func quotaLimitedUser(limits []quotaspec.QuotaLimit) *models.CreatedTeamAPIKey {
@@ -1571,4 +1911,30 @@ func TestCreateSandboxWithClone_StorageAuthHook(t *testing.T) {
 			assert.False(t, exists, "storage-auth annotation should not be present when hook is nil")
 		}
 	})
+}
+
+func TestCleanUpSandboxAfterFailure(t *testing.T) {
+	controller, fc, teardown := Setup(t)
+	defer teardown()
+
+	user := quotaLimitedUser([]quotaspec.QuotaLimit{
+		{Dimension: quotaspec.DimSandboxCount, Scope: quotaspec.ScopeAll, Limit: 10},
+	})
+
+	sbx := &agentsv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-sandbox-cleanup",
+			Namespace: "sandbox-system",
+		},
+	}
+	err := fc.Create(t.Context(), sbx)
+	require.NoError(t, err)
+
+	wrappedSbx := &sandboxcr.Sandbox{Sandbox: sbx, Cache: controller.cache}
+
+	result := controller.cleanUpSandboxAfterFailure(t.Context(), wrappedSbx, user, klog.FromContext(t.Context()))
+	assert.True(t, result)
+
+	err = fc.Get(t.Context(), ctrlclient.ObjectKey{Name: "test-sandbox-cleanup", Namespace: "sandbox-system"}, sbx)
+	assert.True(t, apierrors.IsNotFound(err))
 }

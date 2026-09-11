@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/openkruise/agents/pkg/cache"
+	"github.com/openkruise/agents/pkg/identity"
 	"github.com/openkruise/agents/pkg/sandboxroute"
 	"github.com/openkruise/agents/pkg/utils/timeout"
 )
@@ -176,6 +177,23 @@ type GetSandboxOptions struct {
 	SandboxID string
 }
 
+// IssueTrafficAccessTokenOptions identifies a Sandbox and carries the
+// manager-resolved issuance policy. Validate is invoked against both fresh
+// observations surrounding the external provider call.
+type IssueTrafficAccessTokenOptions struct {
+	Namespace    string
+	SandboxID    string
+	TokenOptions identity.TokenOptions
+	Validate     func(Sandbox) error
+}
+
+// TrafficAccessToken is a transient token returned by an issuance operation.
+// It must never be persisted by an Infrastructure implementation.
+type TrafficAccessToken struct {
+	Token      string
+	Expiration time.Time
+}
+
 type SelectSandboxesOptions struct {
 	Namespace string
 	User      string
@@ -261,13 +279,13 @@ type Infrastructure interface {
 	HasCheckpoint(ctx context.Context, opts HasCheckpointOptions) bool
 	GetCache() cache.Provider // Get the CacheProvider for the infra
 	GetSandboxRouteSource() SandboxRouteSource
-	LoadDebugInfo() map[string]any
 	SelectSandboxes(ctx context.Context, opts SelectSandboxesOptions) ([]Sandbox, error)
 	// GetSandbox looks up a claimed sandbox. Implementations may poll or fall
 	// back while ctx is live; callers must pass a context with a deadline.
 	// A definitive miss must be reported as ErrSandboxNotFound; any other
 	// failure keeps its own error so callers can tell "absent" from "unknown".
 	GetSandbox(ctx context.Context, opts GetSandboxOptions) (Sandbox, error)
+	IssueTrafficAccessToken(ctx context.Context, opts IssueTrafficAccessTokenOptions) (TrafficAccessToken, error)
 	SelectSucceededCheckpoints(ctx context.Context, opts SelectSucceededCheckpointsOptions) ([]CheckpointInfo, error)
 	ClaimSandbox(ctx context.Context, opts ClaimSandboxOptions) (Sandbox, ClaimMetrics, error)
 	CloneSandbox(ctx context.Context, opts CloneSandboxOptions) (Sandbox, CloneMetrics, error)
@@ -309,6 +327,16 @@ type Sandbox interface {
 	SetPodAnnotations(annotations map[string]string)
 	GetPodAnnotations() map[string]string
 	SetTimeout(opts timeout.Options)
+	// EnableWakeOnIngressTraffic arms the wake-on-ingress-traffic resume rule
+	// on the sandbox spec. A positive pauseTimeout becomes the rule's
+	// PauseTimeout so a traffic wake re-arms auto-pause with it; a
+	// non-positive pauseTimeout leaves PauseTimeout unset and the wake does
+	// not re-arm auto-pause.
+	EnableWakeOnIngressTraffic(pauseTimeout time.Duration)
+	// ClearWakeOnIngressTraffic removes the wake-on-ingress-traffic resume
+	// rule and prunes now-empty parent policy nodes so a pooled spec stays
+	// byte-identical to a fresh one.
+	ClearWakeOnIngressTraffic()
 	SaveTimeoutWithPolicy(ctx context.Context, opts SaveTimeoutOptions, policy timeout.UpdatePolicy) (TimeoutUpdateResult, error)
 	GetTimeout() timeout.Options
 	GetClaimTime() (time.Time, error)
@@ -323,6 +351,10 @@ type Sandbox interface {
 	CreateNetworkPolicy(ctx context.Context, network SandboxNetworkConfig) error // Create TrafficPolicy CR for the sandbox
 	UpdateNetworkPolicy(ctx context.Context, network SandboxNetworkConfig) error // Update (replace) existing TrafficPolicy CR with new config
 	SelectNetworkPolicy(ctx context.Context) (*SandboxNetworkConfig, error)      // Query current TrafficPolicy CR and return the effective config
+	// UpdateSecurityRules replaces the sandbox's normalized inline
+	// security-rules annotation with rulesJSON; an empty value removes the
+	// annotation. The write is conflict-retried.
+	UpdateSecurityRules(ctx context.Context, rulesJSON string) error
 }
 
 // MergePodLabels merges the given labels into the sandbox's pod template labels.

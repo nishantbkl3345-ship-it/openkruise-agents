@@ -189,7 +189,7 @@ func TestConfigValidateJWT(t *testing.T) {
 		expectError string
 	}{
 		{name: "JWT mode", cfg: Config{EnableAuth: true, EnableJWTAuth: true}},
-		{name: "JWT requires auth", cfg: Config{EnableJWTAuth: true}, expectError: "requires enable-auth"},
+		{name: "JWT without the UUID baseline", cfg: Config{EnableJWTAuth: true}},
 		{name: "custom header", cfg: Config{EnableAuth: true, EnableJWTAuth: true, TrafficAccessTokenHeader: "X-Custom-JWT"}},
 		{name: "invalid header", cfg: Config{EnableAuth: true, EnableJWTAuth: true, TrafficAccessTokenHeader: "bad header"}, expectError: "not a valid HTTP header"},
 		{name: "runtime token conflict", cfg: Config{EnableAuth: true, EnableJWTAuth: true, TrafficAccessTokenHeader: "X-Access-Token"}, expectError: "must differ"},
@@ -252,11 +252,12 @@ func TestConfigParserJWT(t *testing.T) {
 			expectHeader:     DefaultTrafficAccessTokenHeader,
 		},
 		{
-			name:         "JWT requires authentication",
-			values:       map[string]any{"enable-jwt-auth": true},
-			manager:      &fakeJWTAuthManager{},
-			expectError:  "requires enable-auth",
-			expectHeader: DefaultTrafficAccessTokenHeader,
+			name:             "JWT without the UUID baseline",
+			values:           map[string]any{"enable-jwt-auth": true},
+			manager:          &fakeJWTAuthManager{},
+			expectConfigured: []bool{true},
+			expectJWT:        true,
+			expectHeader:     DefaultTrafficAccessTokenHeader,
 		},
 		{
 			name:        "missing manager",
@@ -686,5 +687,64 @@ func TestConfigParserMergeJWT(t *testing.T) {
 	}
 	if merged.jwtAuthManager != manager {
 		t.Error("merged JWT manager was not preserved")
+	}
+}
+
+func TestGetWakeTimeoutSeconds(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want int
+	}{
+		{
+			name: "default config returns 60",
+			cfg:  DefaultConfig(),
+			want: 60,
+		},
+		{
+			name: "custom wake timeout",
+			cfg:  &Config{WakeTimeoutSeconds: 300},
+			want: 300,
+		},
+		{
+			name: "zero returns default 60",
+			cfg:  &Config{},
+			want: 60,
+		},
+		{
+			name: "negative returns default 60",
+			cfg:  &Config{WakeTimeoutSeconds: -1},
+			want: 60,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetWakeTimeoutSeconds()
+			if got != tt.want {
+				t.Errorf("GetWakeTimeoutSeconds() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeWakeOnTraffic(t *testing.T) {
+	parser := &ConfigParser{}
+	parent := DefaultConfig()
+	child := &Config{
+		EnableWakeOnTraffic: true,
+		WakeTimeoutSeconds:  120,
+	}
+
+	result := parser.Merge(NewFilterConfig(parent), NewFilterConfig(child))
+	fc, ok := result.(*FilterConfig)
+	if !ok {
+		t.Fatalf("Merge() returned %T, want *FilterConfig", result)
+	}
+	if !fc.EnableWakeOnTraffic {
+		t.Error("Merge() did not propagate EnableWakeOnTraffic from child")
+	}
+	if fc.WakeTimeoutSeconds != 120 {
+		t.Errorf("WakeTimeoutSeconds = %d, want 120", fc.WakeTimeoutSeconds)
 	}
 }

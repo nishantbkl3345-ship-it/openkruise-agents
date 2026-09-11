@@ -113,6 +113,52 @@ func TestIsActivePodUpdate(t *testing.T) {
 			description: "should return true when pod IP is assigned",
 		},
 		{
+			name: "PodScheduled condition reports unschedulable",
+			oldPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+				},
+			},
+			newPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:    corev1.PodScheduled,
+						Status:  corev1.ConditionFalse,
+						Reason:  corev1.PodReasonUnschedulable,
+						Message: "insufficient CPU",
+					}},
+				},
+			},
+			expected:    true,
+			description: "should return true when PodScheduled reports Unschedulable",
+		},
+		{
+			name: "PodScheduled condition recovers from unschedulable",
+			oldPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:    corev1.PodScheduled,
+						Status:  corev1.ConditionFalse,
+						Reason:  corev1.PodReasonUnschedulable,
+						Message: "insufficient CPU",
+					}},
+				},
+			},
+			newPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:   corev1.PodScheduled,
+						Status: corev1.ConditionTrue,
+					}},
+				},
+			},
+			expected:    true,
+			description: "should return true when PodScheduled recovers so the startup failure is cleared",
+		},
+		{
 			name: "PodReady condition status changed from False to True",
 			oldPod: &corev1.Pod{
 				Status: corev1.PodStatus{
@@ -545,7 +591,7 @@ func TestIsActivePodUpdate(t *testing.T) {
 			description: "should return false when all tracked conditions are identical",
 		},
 		{
-			name: "Untracked condition changed - should not trigger update",
+			name: "PodScheduled condition changed - should trigger update",
 			oldPod: &corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodRunning,
@@ -573,13 +619,13 @@ func TestIsActivePodUpdate(t *testing.T) {
 						},
 						{
 							Type:   corev1.PodScheduled,
-							Status: corev1.ConditionFalse, // Changed but not tracked
+							Status: corev1.ConditionFalse,
 						},
 					},
 				},
 			},
-			expected:    false,
-			description: "should return false when only untracked conditions change",
+			expected:    true,
+			description: "should return true when PodScheduled changes",
 		},
 		{
 			name: "Multiple conditions but only tracked ones matter",
@@ -1629,6 +1675,82 @@ func TestSandboxPodEventHandler_Delete(t *testing.T) {
 				assert.Equal(t, types.NamespacedName{Namespace: tt.pod.Namespace, Name: tt.pod.Name}, item.NamespacedName)
 				q.Done(item)
 			}
+		})
+	}
+}
+
+func TestIsActivePodUpdate_ProbeConditions(t *testing.T) {
+	probeCondType := corev1.PodConditionType("agents.kruise.io/activity")
+	tests := []struct {
+		name     string
+		oldPod   *corev1.Pod
+		newPod   *corev1.Pod
+		expected bool
+	}{
+		{
+			name: "probe condition changed - status changed",
+			oldPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: probeCondType, Status: corev1.ConditionTrue, Reason: "Active", Message: "agent is active"},
+					},
+				},
+			},
+			newPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: probeCondType, Status: corev1.ConditionFalse, Reason: "Idle", Message: "agent is idle"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "probe condition unchanged",
+			oldPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: probeCondType, Status: corev1.ConditionTrue, Reason: "Active", Message: "agent is active"},
+					},
+				},
+			},
+			newPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: probeCondType, Status: corev1.ConditionTrue, Reason: "Active", Message: "agent is active"},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "probe condition removed",
+			oldPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{
+						{Type: probeCondType, Status: corev1.ConditionTrue, Reason: "Active", Message: "agent is active"},
+					},
+				},
+			},
+			newPod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Phase:      corev1.PodRunning,
+					Conditions: []corev1.PodCondition{},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isActivePodUpdate(tt.oldPod, tt.newPod)
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }

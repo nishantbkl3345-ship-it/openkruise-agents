@@ -30,6 +30,8 @@ jobs:
     steps:
       - name: Checkout Actions Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check spelling with custom config file
         uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
         with:
@@ -38,11 +40,19 @@ jobs:
   golangci-lint:
     runs-on: ubuntu-24.04
     permissions:
+      # Job-level permissions REPLACE the workflow-level `read-all`, they do not
+      # merge with it. Any scope omitted here becomes `none`, so contents and
+      # pull-requests must be listed explicitly.
+      contents: read
       security-events: write
+      # Required by golangci-lint-action's only-new-issues, which fetches the
+      # PR diff from the API.
+      pull-requests: read
     steps:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: true
       - name: Setup Go
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
@@ -52,8 +62,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+          key: ${{ runner.os }}-go-${{ github.ref }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-${{ github.ref }}-
       - name: Code generate
         run: |
           make generate
@@ -64,8 +74,12 @@ jobs:
           args: --verbose
           skip-pkg-cache: true
           mod: readonly
+          # Report only issues introduced by this PR. This is what makes it safe
+          # to enable gosec without the pre-existing findings blocking every
+          # unrelated pull request.
+          only-new-issues: true
       - name: Run Trivy vulnerability scanner in repo mode
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # master
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           scan-type: 'fs'
           ignore-unfixed: true
@@ -73,7 +87,7 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL'
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: 'trivy-results.sarif'
 
@@ -82,6 +96,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: true
       - name: Fetch History
         run: git fetch --prune --unshallow
@@ -93,8 +108,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+          key: ${{ runner.os }}-go-${{ github.ref }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-${{ github.ref }}-
       - name: Run Unit Tests
         run: |
           make test
@@ -106,4 +121,4 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: unittests
-          file: cover.out
+          files: cover.out

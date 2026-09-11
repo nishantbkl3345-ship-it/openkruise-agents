@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -37,21 +38,25 @@ import (
 
 	infracache "github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/sandbox-manager/logs"
+	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
+	"github.com/openkruise/agents/pkg/tracing"
 )
 
 type lookupKeyStorage struct {
-	byKey map[string]*models.CreatedTeamAPIKey
-	calls []string
+	byKey      map[string]*models.CreatedTeamAPIKey
+	calls      []string
+	operations []string
 }
 
 func (s *lookupKeyStorage) Init(context.Context) error { return nil }
 func (s *lookupKeyStorage) Run()                       {}
 func (s *lookupKeyStorage) Stop()                      {}
 
-func (s *lookupKeyStorage) LoadByKey(_ context.Context, key string) (*models.CreatedTeamAPIKey, bool) {
+func (s *lookupKeyStorage) LoadByKey(ctx context.Context, key string) (*models.CreatedTeamAPIKey, bool) {
 	s.calls = append(s.calls, key)
+	s.operations = append(s.operations, tracing.TraceOperationFromContext(ctx))
 	user, ok := s.byKey[key]
 	return user, ok
 }
@@ -89,10 +94,26 @@ func (s *lookupKeyStorage) FindTeamByName(context.Context, string) (*models.Team
 	return nil, false, nil
 }
 
-// TestCheckApiKey_BasicTests tests basic CheckApiKey middleware functionality
-// Note: The "keys nil (auth disabled)" scenario is tested separately
-// to avoid peer initialization timeout issues. See TestCheckApiKey_AnonymousUserWithAdminKeyID
-// for AnonymousUser validation.
+func TestConnectRouteTraceOperation(t *testing.T) {
+	for _, prefix := range []string{"", adapters.CustomPrefix + "/api"} {
+		path := prefix + "/sandboxes/test-sandbox/connect"
+		t.Run(path, func(t *testing.T) {
+			storage := &lookupKeyStorage{}
+			controller := &Controller{mux: http.NewServeMux(), keys: storage}
+			controller.registerRoutes()
+
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req.Header.Set(models.HeaderApiKey, "invalid-key")
+			rec := httptest.NewRecorder()
+			controller.mux.ServeHTTP(rec, req)
+
+			// 在鉴权阶段检查标签，确保尚未查询 Sandbox 状态时就已统一标记。
+			require.Equal(t, http.StatusUnauthorized, rec.Code)
+			assert.Equal(t, []string{"invalid-key"}, storage.calls)
+			assert.Equal(t, []string{traceOpResume}, storage.operations)
+		})
+	}
+}
 
 // TestCheckApiKey_WithRealSetup tests CheckApiKey with full Setup
 func TestCheckApiKey_WithRealSetup(t *testing.T) {
@@ -346,20 +367,28 @@ func TestCheckApiKey_SandboxOwnership(t *testing.T) {
 			expectError:  false,
 		},
 		{
+			name:         "regular user cannot access admin-owned sandbox",
+			apiKeyHeader: regularUser.Key,
+			sandboxID:    adminSandboxID,
+			expectError:  true,
+			expectedCode: http.StatusNotFound,
+			expectedMsg:  "Sandbox route not found, maybe it is crashed or killed: " + adminSandboxID,
+		},
+		{
 			name:         "non-owner cannot access sandbox",
 			apiKeyHeader: anotherUser.Key,
 			sandboxID:    sandboxID,
 			expectError:  true,
-			expectedCode: http.StatusUnauthorized,
-			expectedMsg:  "The user of API key is not the owner of sandbox: " + sandboxID,
+			expectedCode: http.StatusNotFound,
+			expectedMsg:  "Sandbox route not found, maybe it is crashed or killed: " + sandboxID,
 		},
 		{
 			name:         "admin cannot access other user's sandbox",
 			apiKeyHeader: InitKey,
 			sandboxID:    sandboxID,
 			expectError:  true,
-			expectedCode: http.StatusUnauthorized,
-			expectedMsg:  "The user of API key is not the owner of sandbox: " + sandboxID,
+			expectedCode: http.StatusNotFound,
+			expectedMsg:  "Sandbox route not found, maybe it is crashed or killed: " + sandboxID,
 		},
 		{
 			name:         "sandbox not found",
@@ -404,12 +433,28 @@ func TestCheckApiKey_SandboxOwnership(t *testing.T) {
 			}
 		})
 	}
+
+	// Authentication disabled resolves the caller to AnonymousUser, whose ID is AdminKeyID,
+	// so an AdminKeyID-owned sandbox passes on the plain owner comparison alone. This is why
+	// dropping the former AnonymousUser.ID exemption cannot regress the auth-disabled path.
+	// A dedicated Controller with keys=nil isolates this from the running server Setup started,
+	// so the assertion neither races on nor mutates shared state.
+	t.Run("auth disabled caller can access AdminKeyID-owned sandbox", func(t *testing.T) {
+		anonController := &Controller{manager: controller.manager, mgrOpts: controller.mgrOpts}
+
+		req, err := http.NewRequest(http.MethodGet, "http://localhost/test", nil)
+		require.NoError(t, err)
+		req.SetPathValue("sandboxID", adminSandboxID)
+
+		_, apiErr := anonController.CheckApiKey(logs.NewContext(), req)
+		assert.Nil(t, apiErr)
+	})
 }
 
-// TestCheckApiKey_AnonymousUserWithAdminKeyID tests that AnonymousUser has AdminKeyID
-func TestCheckApiKey_AnonymousUserWithAdminKeyID(t *testing.T) {
-	// Verify AnonymousUser has AdminKeyID - this allows admin to access any sandbox
-	assert.Equal(t, keys.AdminKeyID, AnonymousUser.ID, "AnonymousUser should have AdminKeyID")
+// TestCheckApiKey_AnonymousUserAdminKeyCompatibility protects the one-way transition from
+// authentication disabled to enabled: the canonical admin key adopts anonymously owned resources.
+func TestCheckApiKey_AnonymousUserAdminKeyCompatibility(t *testing.T) {
+	assert.Equal(t, keys.AdminKeyID, AnonymousUser.ID, "AnonymousUser resources should remain accessible to the canonical admin key")
 	assert.Equal(t, "auth-disabled", AnonymousUser.Name, "AnonymousUser should have auth-disabled name")
 	assert.Equal(t, models.AdminTeam(), AnonymousUser.Team, "AnonymousUser should carry canonical admin team")
 }
@@ -454,7 +499,7 @@ func TestGetUserFromContext(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			if tt.ctxValue != nil {
-				ctx = context.WithValue(ctx, "user", tt.ctxValue)
+				ctx = context.WithValue(ctx, userContextKey, tt.ctxValue)
 			}
 
 			user := GetUserFromContext(ctx)
@@ -565,6 +610,12 @@ func TestCheckApiKey_VolumeOwnership(t *testing.T) {
 	anotherUser, err := controller.keys.CreateKey(ctx, adminUser, keys.CreateKeyOptions{Name: "another-user", TeamName: "another-team"})
 	require.NoError(t, err)
 	require.NotNil(t, anotherUser)
+
+	// Create another key in the admin namespace to exercise the owner check instead of
+	// returning NotFound during namespace-scoped volume lookup.
+	otherAdminKey, err := controller.keys.CreateKey(ctx, adminUser, keys.CreateKeyOptions{Name: "other-admin-key"})
+	require.NoError(t, err)
+	require.NotNil(t, otherAdminKey)
 	refreshKeyStorageForTest(t, controller)
 
 	// Create namespaces for regular teams (admin uses sandbox-system as fallback)
@@ -637,6 +688,14 @@ func TestCheckApiKey_VolumeOwnership(t *testing.T) {
 			expectError:  false,
 		},
 		{
+			name:         "non-owner admin-team key cannot access admin-owned volume",
+			apiKeyHeader: otherAdminKey.Key,
+			volumeID:     "pv-admin-vol",
+			expectError:  true,
+			expectedCode: http.StatusNotFound,
+			expectedMsg:  "Volume not found: pv-admin-vol",
+		},
+		{
 			name:         "non-owner cannot access volume in same namespace",
 			apiKeyHeader: anotherUser.Key,
 			volumeID:     "pv-regular-vol",
@@ -695,4 +754,20 @@ func TestCheckApiKey_VolumeOwnership(t *testing.T) {
 			}
 		})
 	}
+
+	// Mirror of the sandbox-side auth-disabled case: AnonymousUser is AdminKeyID and admin
+	// resolves to the empty namespace, so getNamespaceOfUser falls back to SystemNamespace
+	// (sandbox-system), where the AdminKeyID-owned volume lives. Dropping the former
+	// AnonymousUser.ID exemption therefore cannot regress the auth-disabled volume path.
+	// A dedicated Controller with keys=nil isolates this from the running server.
+	t.Run("auth disabled caller can access AdminKeyID-owned volume", func(t *testing.T) {
+		anonController := &Controller{manager: controller.manager, mgrOpts: controller.mgrOpts}
+
+		req, err := http.NewRequest(http.MethodGet, "http://localhost/test", nil)
+		require.NoError(t, err)
+		req.SetPathValue("volumeID", "pv-admin-vol")
+
+		_, apiErr := anonController.CheckApiKey(logs.NewContext(), req)
+		assert.Nil(t, apiErr)
+	})
 }

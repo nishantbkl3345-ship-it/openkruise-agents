@@ -198,6 +198,7 @@ func (sc *Controller) ResumeSandbox(r *http.Request) (web.ApiResponse[struct{}],
 	if apiErr := sc.updateConnectTimeout(ctx, sbx, effectiveTimeout, state, autoPause, currentEndAt); apiErr != nil {
 		return web.ApiResponse[struct{}]{}, withSandboxResourceContext(apiErr, sbx)
 	}
+
 	return web.ApiResponse[struct{}]{
 		Code: http.StatusNoContent,
 	}, nil
@@ -209,14 +210,17 @@ func (sc *Controller) ResumeSandbox(r *http.Request) (web.ApiResponse[struct{}],
 // hibernated mid-Resume. The floor is skipped for never-timeout sandboxes
 // (hasDeadline == false) since they carry no deadline.
 func (sc *Controller) getEffectivePauseTimeSeconds(log klog.Logger, requested int, paused, hasDeadline bool) int {
-	if !paused || !hasDeadline || requested >= sc.minResumeTimeoutValue {
+	if !paused || !hasDeadline {
 		return requested
 	}
-	log.Info("connect-on-paused timeout floor applied",
-		"requestedSeconds", requested,
-		"effectiveSeconds", sc.minResumeTimeoutValue,
-		"reason", "request shorter than --e2b-min-resume-timeout")
-	return sc.minResumeTimeoutValue
+	effective := timeout.ApplyResumeTimeoutFloor(requested, timeout.DefaultMinResumeTimeoutSeconds)
+	if effective != requested {
+		log.Info("connect-on-paused timeout floor applied",
+			"requestedSeconds", requested,
+			"effectiveSeconds", effective,
+			"reason", "request shorter than DefaultMinResumeTimeoutSeconds")
+	}
+	return effective
 }
 
 // computeTimeoutOptions computes timeout options from resolved parameters.
@@ -263,6 +267,10 @@ func (sc *Controller) ConnectSandbox(r *http.Request) (web.ApiResponse[*models.S
 	ctx := r.Context()
 	log := klog.FromContext(ctx).WithValues("sandboxID", id)
 	log.Info("connecting sandbox")
+	user := GetUserFromContext(ctx)
+	if user == nil {
+		return web.ApiResponse[*models.Sandbox]{}, &web.ApiError{Code: http.StatusUnauthorized, Message: "User not found"}
+	}
 
 	request, apiErr := ParseSetTimeoutRequest(r, sc.maxTimeout)
 	if apiErr != nil {
@@ -318,10 +326,11 @@ func (sc *Controller) ConnectSandbox(r *http.Request) (web.ApiResponse[*models.S
 		return web.ApiResponse[*models.Sandbox]{}, withSandboxResourceContext(err, sbx)
 	}
 	log.Info("sandbox timeout updated")
+	body := sc.convertToE2BSandbox(sbx, utils.GetAccessToken(sbx), domain)
 
 	return web.ApiResponse[*models.Sandbox]{
 		Code: statusCode,
-		Body: sc.convertToE2BSandbox(sbx, utils.GetAccessToken(sbx), domain),
+		Body: body,
 	}, nil
 }
 

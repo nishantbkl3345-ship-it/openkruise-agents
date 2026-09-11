@@ -44,6 +44,30 @@ type SandboxTemplateSpec struct {
 	// +optional
 	// +listType=atomic
 	Runtimes []RuntimeConfig `json:"runtimes,omitempty"`
+
+	// PauseStrategy configures how sandboxes created from this template are
+	// paused when their spec.paused is true. It is only informational when a
+	// SandboxSet uses spec.templateRef: SandboxSetSpec.PauseStrategy always
+	// takes precedence and is what actually reaches created Sandboxes.
+	// +optional
+	PauseStrategy *PauseStrategy `json:"pauseStrategy,omitempty"`
+
+	// Probes defines the named probes that sandboxes created from this template
+	// run while they are Running. It is only informational when a SandboxSet uses
+	// spec.templateRef: SandboxSetSpec.Probes always takes precedence and is what
+	// actually reaches created Sandboxes.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	Probes []Probe `json:"probes,omitempty"`
+
+	// AutoPausePolicy defines the pause/resume decision rules for sandboxes
+	// created from this template. It is only informational when a SandboxSet uses
+	// spec.templateRef: SandboxSetSpec.AutoPausePolicy always takes precedence and
+	// is what actually reaches created Sandboxes.
+	// +optional
+	AutoPausePolicy *AutoPausePolicy `json:"autoPausePolicy,omitempty"`
 }
 
 // +genclient

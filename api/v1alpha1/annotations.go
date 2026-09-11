@@ -59,6 +59,12 @@ const (
 	// deletion.
 	AnnotationCleanupCandidate = InternalPrefix + "cleanup-candidate"
 
+	// AnnotationSecurityRules carries the normalized inline egress security
+	// rules (a JSON array of SecurityRule) for one Sandbox. Only the Sandbox
+	// Manager writes it; the Egress Policy Enforcer evaluates the rules under
+	// the calling workload's verified identity.
+	AnnotationSecurityRules = InternalPrefix + "security-rules"
+
 	// SandboxAnnotationPriority is the annotation key for sandbox priority.
 	// If not set, the default value is 0.
 	// Larger values indicate higher priority.
@@ -84,6 +90,11 @@ const (
 	AnnotationEnvdURL         = E2BPrefix + "envd-url"
 	// AnnotationCSIVolumeConfig is the annotation key for CSI mount configuration.
 	AnnotationCSIVolumeConfig = E2BPrefix + "csi-volume-config"
+	// MetadataKeySecurityRules is the reserved E2B metadata key whose value is
+	// a JSON array of inline security rules. It is consumed by the Sandbox
+	// Manager and normalized into AnnotationSecurityRules; tenants can never
+	// write AnnotationSecurityRules directly.
+	MetadataKeySecurityRules = E2BPrefix + "security-rules"
 )
 
 // AnnotationUpgradeResumeTrigger is set by SandboxUpdateOps on a paused sandbox
@@ -93,3 +104,10 @@ const (
 // patches the template and removes this annotation to trigger the actual
 // pod replacement.
 const AnnotationUpgradeResumeTrigger = InternalPrefix + "upgrade-resume-trigger"
+
+// AnnotationPodProbe is the annotation key used by the PodProbeMarker Serverless
+// protocol. The sandbox controller writes probe definitions to this annotation
+// on the Pod, and the agent-runtime sidecar reads them, executes the probes,
+// and writes results to Pod.Status.Conditions.
+// See: https://openkruise.io/docs/user-manuals/podprobemarker#support-for-serverless-scenarios
+const AnnotationPodProbe = "kruise.io/podprobe"

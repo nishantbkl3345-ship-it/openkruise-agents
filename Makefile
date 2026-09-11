@@ -18,7 +18,6 @@ CONTROLLER_IMG ?= agent-sandbox-controller:latest
 MANAGER_IMG ?= sandbox-manager:latest
 RUNTIME_IMG ?= agent-runtime:latest
 GATEWAY_IMG ?= $(GATEWAY_PLUGIN_NAME):latest
-TRAFFIX_EXTENSION_IMG ?= traffic-extension:latest
 PLATFORMS ?= linux/amd64,linux/arm64
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
@@ -80,7 +79,7 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 build: generate fmt vet manifests ## Build manager binary.
-	go build -o bin/agent-sandbox-controller cmd/agent-sandbox-controller/main.go
+	go build -o bin/agent-sandbox-controller ./cmd/agent-sandbox-controller
 
 .PHONY: build-okactl
 build-okactl: ## Build okactl CLI binary.
@@ -190,10 +189,6 @@ docker-buildx-sandbox-gateway: ## Build multi-platform docker image for sandbox-
 docker-pushx-sandbox-gateway: ## Build and push multi-platform docker image for sandbox-gateway.
 	docker buildx build --platform=$(PLATFORMS) -f dockerfiles/sandbox-gateway.Dockerfile -t ${GATEWAY_IMG} --push .
 
-.PHONY: build-traffic-extension
-build-traffic-extension: ## Build traffic-extension binary.
-	go build -o bin/traffic-extension ./cmd/traffic-extension
-
 # VERSION is derived from the nearest git tag; falls back to "dev" in untagged repos.
 STORAGE_CLI_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
@@ -201,18 +196,6 @@ STORAGE_CLI_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null 
 build-storage-cli: ## Build sandbox-runtime-storage (storage-cli) binary with version injected via ldflags.
 	go build -trimpath -ldflags="-s -w -X main.version=$(STORAGE_CLI_VERSION)" \
 		-o bin/sandbox-runtime-storage ./pkg/agent-runtime/storage-cli/
-
-.PHONY: docker-build-traffic-extension
-docker-build-traffic-extension: ## Build docker image for traffic-extension.
-	docker build -f dockerfiles/traffic-extension.Dockerfile -t ${TRAFFIX_EXTENSION_IMG} .
-
-.PHONY: docker-buildx-traffic-extension
-docker-buildx-traffic-extension: ## Build multi-platform docker image for traffic-extension.
-	docker buildx build --platform=$(PLATFORMS) -f dockerfiles/traffic-extension.Dockerfile -t ${TRAFFIX_EXTENSION_IMG} .
-
-.PHONY: docker-pushx-traffic-extension
-docker-pushx-traffic-extension: ## Build and push multi-platform docker image for traffic-extension.
-	docker buildx build --platform=$(PLATFORMS) -f dockerfiles/traffic-extension.Dockerfile -t ${TRAFFIX_EXTENSION_IMG} --push .
 
 ifndef ignore-not-found
   ignore-not-found = false
@@ -281,9 +264,13 @@ ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -
 GOLANGCI_LINT_VERSION ?= v2.3.0
 
 # Run tests
+# -p 1 runs test binaries serially: pkg/proxy, pkg/sandbox-manager and
+# pkg/servers/e2b bind the fixed route-refresh (7789) and ext-proc (9002)
+# ports, and a bind failure is now a hard test failure. Drop it once those
+# listeners take injectable ports.
 .PHONY: test
 test:
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test -race ./pkg/... -coverprofile raw-cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test -race -p 1 ./pkg/... -coverprofile raw-cover.out
 	grep -v "pkg/client" raw-cover.out > cover.out
 
 .PHONY: kustomize

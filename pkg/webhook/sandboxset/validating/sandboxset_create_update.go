@@ -19,11 +19,11 @@ package validating
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 
-	apicorev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/autopause"
 	webhookutils "github.com/openkruise/agents/pkg/webhook/utils"
 )
 
@@ -106,77 +107,66 @@ func validateSandboxSetSpec(spec agentsv1alpha1.SandboxSetSpec, fldPath *field.P
 		errList = append(errList, validateSandboxSetPodTemplateSpec(spec, fldPath)...)
 	}
 
-	if _, err := intstrutil.GetScaledValueFromIntOrPercent(
-		intstrutil.ValueOrDefault(spec.ScaleStrategy.MaxUnavailable, intstrutil.FromInt32(math.MaxInt32)), int(spec.Replicas), true); err != nil {
-		errList = append(errList, field.Invalid(fldPath.Child("scaleStrategy.maxUnavailable"), spec.ScaleStrategy.MaxUnavailable, "maxUnavailable is invalid"))
-	}
+	errList = append(errList,
+		validateMaxUnavailable(spec.ScaleStrategy.MaxUnavailable, fldPath.Child("scaleStrategy.maxUnavailable"))...)
+	errList = append(errList,
+		validateMaxUnavailable(spec.UpdateStrategy.MaxUnavailable, fldPath.Child("updateStrategy.maxUnavailable"))...)
 
-	// Validate UpdateStrategy.MaxUnavailable if specified
-	if spec.UpdateStrategy.MaxUnavailable != nil {
-		if _, err := intstrutil.GetScaledValueFromIntOrPercent(
-			intstrutil.ValueOrDefault(spec.UpdateStrategy.MaxUnavailable, intstrutil.FromInt(0)), int(spec.Replicas), true); err != nil {
-			errList = append(errList, field.Invalid(fldPath.Child("updateStrategy.maxUnavailable"), spec.UpdateStrategy.MaxUnavailable, "maxUnavailable is invalid"))
+	errList = append(errList, autopause.ValidateProbes(spec.Probes, fldPath.Child("probes"))...)
+	errList = append(errList, autopause.ValidateAutoPausePolicy(spec.AutoPausePolicy, spec.Probes, fldPath.Child("autoPausePolicy"))...)
+
+	return errList
+}
+
+// maxUnavailablePercentPattern matches percentage strings such as "70%". A
+// leading sign, decimals, or extra whitespace are rejected so both the
+// controller and defaulter can rely on a normalized form.
+var maxUnavailablePercentPattern = regexp.MustCompile(`^([0-9]+)%$`)
+
+// validateMaxUnavailable enforces that maxUnavailable is either a non-negative
+// integer or a percentage string in the closed range [0%, 100%]. With this in
+// place the controller can call intstr helpers without an error branch, so
+// runtime spec validation and event emission can be removed.
+func validateMaxUnavailable(v *intstrutil.IntOrString, fldPath *field.Path) field.ErrorList {
+	if v == nil {
+		return nil
+	}
+	var errList field.ErrorList
+	switch v.Type {
+	case intstrutil.Int:
+		if v.IntVal < 0 {
+			errList = append(errList, field.Invalid(fldPath, v.IntVal, "must be >= 0"))
 		}
+	case intstrutil.String:
+		matches := maxUnavailablePercentPattern.FindStringSubmatch(v.StrVal)
+		if matches == nil {
+			errList = append(errList, field.Invalid(fldPath, v.StrVal,
+				`must be a percentage in the form "<number>%" (e.g. "20%")`))
+			return errList
+		}
+		percent, err := strconv.Atoi(matches[1])
+		if err != nil || percent > 100 {
+			errList = append(errList, field.Invalid(fldPath, v.StrVal, "must be within [0%, 100%]"))
+		}
+	default:
+		errList = append(errList, field.Invalid(fldPath, v, "unsupported IntOrString type"))
 	}
-
 	return errList
 }
 
 func validateSandboxSetPodTemplateSpec(spec agentsv1alpha1.SandboxSetSpec, fldPath *field.Path) field.ErrorList {
 	errList := field.ErrorList{}
+	template := spec.Template.DeepCopy()
 	coreTemplate := &core.PodTemplateSpec{}
 
-	if err := corev1conv.Convert_v1_PodTemplateSpec_To_core_PodTemplateSpec(spec.Template.DeepCopy(), coreTemplate, nil); err != nil {
+	if len(spec.VolumeClaimTemplates) != 0 {
+		errList = append(errList, webhookutils.ValidateVolumeClaimTemplateMounts(spec.Template, spec.VolumeClaimTemplates, fldPath)...)
+		webhookutils.AppendVolumeClaimTemplateVolumes(template, spec.VolumeClaimTemplates)
+	}
+	if err := corev1conv.Convert_v1_PodTemplateSpec_To_core_PodTemplateSpec(template, coreTemplate, nil); err != nil {
 		errList = append(errList, field.Invalid(fldPath.Child("template"), spec.Template, fmt.Sprintf("Convert_v1_PodTemplateSpec_To_core_PodTemplateSpec failed: %v", err)))
 		return errList
 	}
-	if len(spec.VolumeClaimTemplates) != 0 {
-		errList = append(errList, validateVolumeClaimTemplateMounts(spec, fldPath)...)
-		for _, template := range spec.VolumeClaimTemplates {
-			coreTemplate.Spec.Volumes = append(coreTemplate.Spec.Volumes, core.Volume{
-				Name: template.Name,
-				VolumeSource: core.VolumeSource{
-					PersistentVolumeClaim: &core.PersistentVolumeClaimVolumeSource{
-						ClaimName: template.Name,
-					},
-				},
-			})
-		}
-	}
 	errList = append(errList, corevalidation.ValidatePodTemplateSpec(coreTemplate, fldPath.Child("template"), webhookutils.DefaultPodValidationOptions)...)
-	return errList
-}
-
-func validateVolumeClaimTemplateMounts(spec agentsv1alpha1.SandboxSetSpec, fldPath *field.Path) field.ErrorList {
-	errList := field.ErrorList{}
-	mountedVolumeNames := map[string]struct{}{}
-
-	recordMounts := func(containers []apicorev1.Container) {
-		for i := range containers {
-			for j := range containers[i].VolumeMounts {
-				mountedVolumeNames[containers[i].VolumeMounts[j].Name] = struct{}{}
-			}
-		}
-	}
-	recordMounts(spec.Template.Spec.InitContainers)
-	recordMounts(spec.Template.Spec.Containers)
-	for i := range spec.Template.Spec.EphemeralContainers {
-		for j := range spec.Template.Spec.EphemeralContainers[i].VolumeMounts {
-			mountedVolumeNames[spec.Template.Spec.EphemeralContainers[i].VolumeMounts[j].Name] = struct{}{}
-		}
-	}
-
-	for i, template := range spec.VolumeClaimTemplates {
-		if template.Name == "" {
-			continue
-		}
-		if _, mounted := mountedVolumeNames[template.Name]; !mounted {
-			errList = append(errList, field.Invalid(
-				fldPath.Child("volumeClaimTemplates").Index(i).Child("metadata").Child("name"),
-				template.Name,
-				"must be mounted by at least one container, init container, or ephemeral container",
-			))
-		}
-	}
 	return errList
 }

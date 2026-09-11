@@ -20,10 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -36,16 +36,16 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/logs"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
+	"github.com/openkruise/agents/pkg/utils/network"
 	utilruntime "github.com/openkruise/agents/pkg/utils/runtime"
 )
 
 // Controller handles sandbox-related operations
 type Controller struct {
 	// E2B API surface
-	maxTimeout            int
-	minResumeTimeoutValue int
-	domain                string
-	keyCfg                *keys.Config
+	maxTimeout int
+	domain     string
+	keyCfg     *keys.Config
 
 	// mgrOpts is handed to the sandbox-manager builder unchanged. It also carries
 	// the system namespace the API handlers fall back to, so it is the single
@@ -59,7 +59,7 @@ type Controller struct {
 	// fields
 	mux             *http.ServeMux
 	server          *http.Server
-	stop            chan os.Signal
+	metricsServer   *http.Server
 	cache           cache.Provider
 	storageRegistry storages.VolumeMountProviderRegistry
 	adapter         *adapters.E2BAdapter
@@ -76,11 +76,13 @@ type ControllerOptions struct {
 	Domain string
 	// Port is the port the E2B HTTP server listens on.
 	Port int
+	// MetricsPort is the port for GET /metrics. 0 or the same value as Port
+	// serves it on the control API listener; any other positive port starts a
+	// dedicated observability listener. Negative values are invalid and
+	// rejected by startup validation.
+	MetricsPort int
 	// MaxTimeout is the E2B maximum sandbox timeout in seconds.
 	MaxTimeout int
-	// MinResumeTimeout is the floor, in seconds, applied to the timeout carried
-	// by the E2B connect API.
-	MinResumeTimeout int
 	// KeyConfig configures API key storage. Nil disables E2B authentication.
 	KeyConfig *keys.Config
 
@@ -95,20 +97,31 @@ type ControllerOptions struct {
 // NewController creates a new E2B Controller from opts.
 func NewController(opts ControllerOptions) *Controller {
 	sc := &Controller{
-		mux:                   http.NewServeMux(),
-		domain:                opts.Domain,
-		adapter:               adapters.DefaultAdapterFactory(opts.Port),
-		maxTimeout:            opts.MaxTimeout,
-		minResumeTimeoutValue: opts.MinResumeTimeout,
-		keyCfg:                opts.KeyConfig,
-		mgrOpts:               opts.Manager,
-		runtimeTLSBundle:      opts.RuntimeTLSBundle,
+		mux:              http.NewServeMux(),
+		domain:           opts.Domain,
+		adapter:          adapters.DefaultAdapterFactory(opts.Port, opts.Manager.BindAddress),
+		maxTimeout:       opts.MaxTimeout,
+		keyCfg:           opts.KeyConfig,
+		mgrOpts:          opts.Manager,
+		runtimeTLSBundle: opts.RuntimeTLSBundle,
 	}
 
 	sc.server = &http.Server{
-		Addr:              fmt.Sprintf(":%d", opts.Port),
+		Addr:              network.ListenAddress(opts.Manager.BindAddress, opts.Port),
 		Handler:           sc.mux,
 		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	if opts.MetricsPort > 0 && opts.MetricsPort != opts.Port {
+		metricsMux := http.NewServeMux()
+		registerObservabilityRoutes(metricsMux)
+		sc.metricsServer = &http.Server{
+			Addr:              fmt.Sprintf(":%d", opts.MetricsPort),
+			Handler:           metricsMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+	} else {
+		registerObservabilityRoutes(sc.mux)
 	}
 
 	return sc
@@ -173,38 +186,145 @@ func (sc *Controller) initKeyStorage(ctx context.Context) error {
 	return nil
 }
 
-func (sc *Controller) Run() (context.Context, error) {
-	if sc.stop != nil {
-		return nil, errors.New("controller already started")
-	}
+// Run starts the controller in two phases.
+//
+// stop delivers the termination signal and must be buffered (capacity >= 1)
+// so a signal racing startup is not dropped by a non-blocking sender.
+//
+// The returned context is canceled when the controller is done: immediately
+// after an interrupted or failed startup, and only after the graceful
+// shutdown chain completes in steady state.
+//
+// An interrupted startup skips memberlist Leave and leader lease release;
+// peers converge through the memberlist suspicion timeout (a few seconds with
+// the tuned probe settings) and the lease expires via TTL. Both self-heal
+// without operator action. Upgrade path: run the shutdown chain in the
+// interrupted branch once graceful leaf cleanup during startup is required.
+func (sc *Controller) Run(stop <-chan os.Signal) (context.Context, error) {
 	ctx, cancel := context.WithCancel(logs.NewContext())
-	// Channel to listen for interrupt signal
-	sc.stop = make(chan os.Signal, 1)
-	signal.Notify(sc.stop, syscall.SIGINT, syscall.SIGTERM)
-	if err := sc.manager.Run(ctx); err != nil {
-		klog.Fatalf("Sandbox manager failed to start: %v", err)
-	}
 
-	// Run HTTP server in a goroutine
+	startupDone := make(chan error, 1)
 	go func() {
-		klog.InfoS("Starting Server", "address", sc.server.Addr)
-		if err := sc.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			klog.Fatalf("HTTP server failed to start: %v", err)
-		}
+		startupDone <- sc.startComponents(ctx)
 	}()
 
-	// stopper
+	outcome, err := awaitStartup(startupDone, stop)
+	switch outcome {
+	case startupInterrupted:
+		klog.FromContext(ctx).Info("termination signal during startup, exiting without graceful cleanup")
+		cancel()
+		return ctx, nil
+	case startupFailed:
+		klog.FromContext(ctx).Error(err, "startup failed, exiting")
+		cancel()
+		return ctx, err
+	}
+
+	// Steady state: a signal triggers the graceful shutdown chain. A signal
+	// that awaitStartup already consumed alongside a completed startup starts
+	// the chain right away.
 	go func() {
-		<-sc.stop
+		if outcome != startupSignaled {
+			<-stop
+		}
 		shutdownCtx, shutdownCancel := context.WithTimeout(logs.NewContext("action", "shutdown"), consts.ShutdownTimeout)
 		defer shutdownCancel()
 		sc.shutdown(shutdownCtx, cancel)
 	}()
+	return ctx, nil
+}
 
+// startComponents runs the sequential startup pipeline in the background so
+// Run can race it against termination signals. Key storage starts last: once
+// startComponents reports success, shutdown may assume keys.Run has run and
+// pair it with keys.Stop.
+func (sc *Controller) startComponents(ctx context.Context) error {
+	if err := sc.manager.Run(ctx); err != nil {
+		return fmt.Errorf("sandbox manager failed to start: %w", err)
+	}
+	if err := sc.startHTTPServer(); err != nil {
+		return err
+	}
+	if sc.metricsServer != nil {
+		go serveMetrics(sc.metricsServer)
+	}
 	if sc.keys != nil {
 		sc.keys.Run()
 	}
-	return ctx, nil
+	return nil
+}
+
+// startupOutcome classifies how controller startup ended.
+type startupOutcome int
+
+const (
+	// startupCompleted: startup succeeded and no termination signal was seen.
+	startupCompleted startupOutcome = iota
+	// startupSignaled: startup succeeded and a termination signal was
+	// consumed alongside it; the caller must start graceful shutdown itself.
+	startupSignaled
+	startupFailed
+	// startupInterrupted: a termination signal preempted an unfinished startup.
+	startupInterrupted
+)
+
+// awaitStartup races startup completion against a termination signal. A
+// startup result that is already available when the signal is observed still
+// wins, so a fully started controller is never torn down with crash
+// semantics; only an unfinished startup is interrupted.
+func awaitStartup(startupDone <-chan error, stop <-chan os.Signal) (startupOutcome, error) {
+	select {
+	case err := <-startupDone:
+		return classifyStartup(err, startupCompleted)
+	case <-stop:
+		select {
+		case err := <-startupDone:
+			return classifyStartup(err, startupSignaled)
+		default:
+			return startupInterrupted, nil
+		}
+	}
+}
+
+func classifyStartup(err error, success startupOutcome) (startupOutcome, error) {
+	if err != nil {
+		return startupFailed, err
+	}
+	return success, nil
+}
+
+func (sc *Controller) startHTTPServer() error {
+	listener, err := net.Listen("tcp", sc.server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen for E2B API on %s: %w", sc.server.Addr, err)
+	}
+
+	go func() {
+		klog.InfoS("Starting Server", "address", listener.Addr().String())
+		if err := sc.server.Serve(listener); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			klog.Fatalf("HTTP server failed: %v", err)
+		}
+	}()
+	return nil
+}
+
+func serveMetrics(server *http.Server) {
+	klog.InfoS("Starting metrics server", "address", server.Addr)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Metrics live only on this listener once a dedicated port is configured,
+		// so a bind failure is a fatal misconfiguration, matching the control API listener.
+		klog.Fatalf("metrics HTTP server failed to start: %v", err)
+	}
+}
+
+func shutdownHTTPServer(ctx context.Context, srv *http.Server, msg string) {
+	if srv == nil {
+		return
+	}
+	if err := srv.Shutdown(ctx); err != nil {
+		klog.ErrorS(err, msg)
+	}
 }
 
 func (sc *Controller) shutdown(ctx context.Context, cancel context.CancelFunc) {
@@ -212,14 +332,23 @@ func (sc *Controller) shutdown(ctx context.Context, cancel context.CancelFunc) {
 	log.Info("Shutting down server...")
 	defer cancel()
 
-	if sc.server != nil {
-		if err := sc.server.Shutdown(ctx); err != nil {
-			klog.ErrorS(err, "HTTP server forced to shutdown")
-		}
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		shutdownHTTPServer(ctx, sc.server, "HTTP server forced to shutdown")
+	}()
+	go func() {
+		defer wg.Done()
+		shutdownHTTPServer(ctx, sc.metricsServer, "metrics HTTP server forced to shutdown")
+	}()
+	wg.Wait()
 	if sc.manager != nil {
 		sc.manager.Stop(ctx)
 	}
+	// shutdown runs only after startup reported success, so keys.Run has been
+	// called and keys.Stop cannot block on a worker that never started
+	// (secretKeyStorage.Stop waits for its done channel).
 	if sc.keys != nil {
 		sc.keys.Stop()
 	}

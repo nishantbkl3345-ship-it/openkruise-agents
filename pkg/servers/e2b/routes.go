@@ -35,30 +35,33 @@ import (
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
 	"github.com/openkruise/agents/pkg/servers/web"
+	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 )
 
 func (sc *Controller) registerRoutes() {
-	sc.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+	healthHandler := func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, err := fmt.Fprintf(w, "OK")
 		if err != nil {
 			klog.ErrorS(err, "Failed to write health check response")
 		}
-	})
-
-	// Prometheus metrics endpoint for exporting metrics
-	sc.mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+	}
+	sc.mux.HandleFunc("GET /health", healthHandler)
+	// Also register under the /kruise/api prefix so requests routed through
+	// the sandbox-gateway (which forwards /kruise/api/* to the manager) work.
+	sc.mux.HandleFunc("GET "+adapters.CustomPrefix+"/api/health", healthHandler)
 
 	// Sandbox management endpoints
-	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes", sc.CreateSandbox, sc.CheckApiKey)
+	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes", sc.CreateSandbox, traceOperation(traceOpCreate), sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/v2/sandboxes", sc.ListSandboxes, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/sandboxes/{sandboxID}", sc.DescribeSandbox, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodDelete, "/sandboxes/{sandboxID}", sc.DeleteSandbox, sc.CheckApiKey)
+	RegisterE2BRoute(sc.mux, http.MethodDelete, "/sandboxes/{sandboxID}", sc.DeleteSandbox, traceOperation(traceOpKill), sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodPut, "/sandboxes/{sandboxID}/network", sc.UpdateSandboxNetwork, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/pause", sc.PauseSandbox, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/resume", sc.ResumeSandbox, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/connect", sc.ConnectSandbox, sc.CheckApiKey)
+	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/pause", sc.PauseSandbox, traceOperation(traceOpPause), sc.CheckApiKey)
+	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/resume", sc.ResumeSandbox, traceOperation(traceOpResume), sc.CheckApiKey)
+	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/connect", sc.ConnectSandbox, traceOperation(traceOpResume), sc.CheckApiKey)
+	web.RegisterRoute(sc.mux, http.MethodPost, adapters.CustomPrefix+"/api/sandboxes/{sandboxID}/traffic-access-token", sc.RefreshTrafficAccessToken, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/timeout", sc.SetSandboxTimeout, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodPost, "/sandboxes/{sandboxID}/snapshots", sc.CreateSnapshot, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/snapshots", sc.ListSnapshots, sc.CheckApiKey)
@@ -66,7 +69,6 @@ func (sc *Controller) registerRoutes() {
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/templates/{templateID}", sc.GetTemplate, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodDelete, "/templates/{templateID}", sc.DeleteTemplate, sc.CheckApiKey)
 	RegisterE2BRoute(sc.mux, http.MethodGet, "/browser/{sandboxID}/json/version", sc.BrowserUse, sc.CheckApiKey)
-	RegisterE2BRoute(sc.mux, http.MethodGet, "/debug", sc.Debug, sc.CheckApiKey)
 
 	// Volume management endpoints
 	// Temporarily disabled.
@@ -92,8 +94,37 @@ func RegisterE2BRoute[T any](mux *http.ServeMux, method, path string, handler we
 	web.RegisterRoute(mux, method, adapters.CustomPrefix+"/api"+path, handler, middlewares...)
 }
 
-// AnonymousUser is used only when authentication is disabled. It has the same Key as Admin,
-// allowing for subsequent restrictions on Admin user request interfaces.
+func registerObservabilityRoutes(mux *http.ServeMux) {
+	// Prometheus metrics endpoint for exporting metrics
+	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+}
+
+// User-facing trace operation verbs recorded in baggage and surfaced as the
+// "traceOperation" field in cross-component logs. Users think in terms of
+// create/pause/resume/kill regardless of which HTTP route triggered the
+// operation. The verb is bound once per HTTP request at the entry point, so
+// internal sub-operations (e.g. anything a delete does under the hood) always
+// inherit the entry verb.
+const (
+	traceOpCreate = "create"
+	traceOpPause  = "pause"
+	traceOpResume = "resume"
+	traceOpKill   = "kill"
+)
+
+// traceOperation returns a middleware that overrides the trace operation
+// recorded in baggage with a short user-facing verb (e.g. "create", "kill")
+// instead of the default "METHOD /route" pattern set by the web framework.
+// The verb propagates to the controller via the trace-baggage CR annotation
+// and surfaces as the "traceOperation" field in cross-component logs.
+func traceOperation(operation string) web.MiddleWare {
+	return func(ctx context.Context, _ *http.Request) (context.Context, *web.ApiError) {
+		return tracing.WithTraceOperation(ctx, operation), nil
+	}
+}
+
+// AnonymousUser owns resources created while authentication is disabled. Reusing AdminKeyID
+// lets the canonical admin key access those resources after authentication is enabled.
 var AnonymousUser = &models.CreatedTeamAPIKey{
 	ID:   keys.AdminKeyID,
 	Name: "auth-disabled",
@@ -103,7 +134,7 @@ var AnonymousUser = &models.CreatedTeamAPIKey{
 // CheckApiKey implements common ApiKey validation
 func (sc *Controller) CheckApiKey(ctx context.Context, r *http.Request) (context.Context, *web.ApiError) {
 	logger := klog.FromContext(ctx)
-	middleWareLog := logger.WithValues("middleware", "CheckApiKey").V(utils.DebugLogLevel)
+	middleWareLog := logger.WithValues("middleware", "CheckApiKey")
 	apiKey := r.Header.Get(models.HeaderApiKey)
 	var user *models.CreatedTeamAPIKey
 	var ok bool
@@ -115,7 +146,7 @@ func (sc *Controller) CheckApiKey(ctx context.Context, r *http.Request) (context
 		rawAPIKey := keys.ToStoredRawAPIKey(apiKey)
 		user, ok = sc.keys.LoadByKey(ctx, rawAPIKey)
 		if !ok {
-			middleWareLog.Info("failed to load key by API-KEY")
+			middleWareLog.V(utils.DebugLogLevel).Info("failed to load key by API-KEY")
 			return ctx, &web.ApiError{
 				Code:    http.StatusUnauthorized,
 				Message: "Invalid API Key",
@@ -126,16 +157,20 @@ func (sc *Controller) CheckApiKey(ctx context.Context, r *http.Request) (context
 		middleWareLog = middleWareLog.WithValues("sandboxID", sandboxID)
 		owner, ok := sc.manager.GetOwnerOfSandbox(sandboxID)
 		if !ok {
-			middleWareLog.Info("failed to get owner of sandbox")
+			middleWareLog.V(utils.DebugLogLevel).Info("failed to get owner of sandbox")
 			return ctx, &web.ApiError{
 				Code:    http.StatusNotFound,
 				Message: fmt.Sprintf("Sandbox route not found, maybe it is crashed or killed: %s", sandboxID),
 			}
 		}
-		if owner != AnonymousUser.ID.String() && owner != user.ID.String() {
+		// An ownership mismatch returns the same not-found response as a missing route so
+		// authenticated callers cannot probe which sandbox IDs exist. That makes this log
+		// the only signal separating a denial from a genuine miss.
+		if owner != user.ID.String() {
+			middleWareLog.Info("sandbox owner mismatch", "owner", owner, "user", user.ID.String())
 			return ctx, &web.ApiError{
-				Code:    http.StatusUnauthorized,
-				Message: fmt.Sprintf("The user of API key is not the owner of sandbox: %s", sandboxID),
+				Code:    http.StatusNotFound,
+				Message: fmt.Sprintf("Sandbox route not found, maybe it is crashed or killed: %s", sandboxID),
 			}
 		}
 	}
@@ -147,27 +182,35 @@ func (sc *Controller) CheckApiKey(ctx context.Context, r *http.Request) (context
 		}
 		owner, ok := sc.manager.GetOwnerOfVolume(ctx, namespace, volumeID)
 		if !ok {
-			middleWareLog.Info("failed to get owner of volume")
+			middleWareLog.V(utils.DebugLogLevel).Info("failed to get owner of volume")
 			return ctx, &web.ApiError{
 				Code:    http.StatusNotFound,
 				Message: fmt.Sprintf("Volume not found: %s", volumeID),
 			}
 		}
-		if owner != AnonymousUser.ID.String() && owner != user.ID.String() {
+		// Same anti-enumeration rule as the sandbox check above: ownership mismatch is
+		// indistinguishable from a missing volume.
+		if owner != user.ID.String() {
+			middleWareLog.Info("volume owner mismatch", "owner", owner, "user", user.ID.String())
 			return ctx, &web.ApiError{
-				Code:    http.StatusUnauthorized,
-				Message: fmt.Sprintf("The user of API key is not the owner of volume: %s", volumeID),
+				Code:    http.StatusNotFound,
+				Message: fmt.Sprintf("Volume not found: %s", volumeID),
 			}
 		}
 	}
 	ctx = klog.NewContext(ctx, logger.WithValues("user", user.Name))
-	ctx = context.WithValue(ctx, "user", user)
+	ctx = context.WithValue(ctx, userContextKey, user)
 	return ctx, nil
 }
 
+// contextKey is an unexported type for context keys defined in this package,
+// so they cannot collide with keys set by other packages on the same request.
+type contextKey string
+
 const (
-	newAPIKeyRequestContextKey = "newAPIKeyRequest"
-	targetAPIKeyContextKey     = "targetAPIKey"
+	userContextKey             contextKey = "user"
+	newAPIKeyRequestContextKey contextKey = "newAPIKeyRequest"
+	targetAPIKeyContextKey     contextKey = "targetAPIKey"
 )
 
 func (sc *Controller) CheckCreateAPIKeyPermission(ctx context.Context, r *http.Request) (context.Context, *web.ApiError) {
@@ -300,7 +343,7 @@ func (sc *Controller) validateTeamNamespace(ctx context.Context, teamName string
 }
 
 func GetUserFromContext(ctx context.Context) *models.CreatedTeamAPIKey {
-	value := ctx.Value("user")
+	value := ctx.Value(userContextKey)
 	user, ok := value.(*models.CreatedTeamAPIKey)
 	if !ok {
 		return nil

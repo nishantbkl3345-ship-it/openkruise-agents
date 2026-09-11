@@ -72,6 +72,22 @@ func GetSandboxCondition(status *agentsv1alpha1.SandboxStatus, condType string) 
 	}
 	return nil
 }
+
+// IsSandboxStartupFailureReason reports whether a Sandbox Ready condition
+// reason represents a definitive startup failure. Callers that gate on
+// startup failures (e.g. the SandboxSet startup budget and the cache
+// wait-ready task) share this single reason set.
+func IsSandboxStartupFailureReason(reason string) bool {
+	switch reason {
+	case agentsv1alpha1.SandboxReadyReasonStartContainerFailed,
+		agentsv1alpha1.SandboxReadyReasonPodCreateFailed,
+		agentsv1alpha1.SandboxReadyReasonUnschedulable:
+		return true
+	default:
+		return false
+	}
+}
+
 func GetPodCondition(status *corev1.PodStatus, condType corev1.PodConditionType) *corev1.PodCondition {
 	for i := range status.Conditions {
 		c := &status.Conditions[i]
@@ -237,7 +253,7 @@ func GetSandboxState(sbx *agentsv1alpha1.Sandbox) (state string, reason string) 
 		return agentsv1alpha1.SandboxStateDead, "ShutdownTimeReached"
 	}
 	if sbx.Status.Phase == agentsv1alpha1.SandboxPending {
-		return agentsv1alpha1.SandboxStateCreating, "ResourcePending"
+		return agentsv1alpha1.SandboxStateCreating, agentsv1alpha1.SandboxStateReasonResourcePending
 	}
 	if sbx.Status.Phase == agentsv1alpha1.SandboxSucceeded {
 		return agentsv1alpha1.SandboxStateDead, "ResourceSucceeded"
@@ -383,6 +399,27 @@ func IsSandboxResumable(sbx *agentsv1alpha1.Sandbox) (bool, string) {
 		return false, "SandboxIsPausing"
 	}
 	return false, "SandboxPhaseNotAllowed"
+}
+
+// WakeOnIngressTrafficEnabled reports whether the sandbox opted into
+// wake-on-traffic via its spec.
+func WakeOnIngressTrafficEnabled(sbx *agentsv1alpha1.Sandbox) bool {
+	return sbx != nil && sbx.Spec.AutoPausePolicy != nil &&
+		sbx.Spec.AutoPausePolicy.Resume != nil &&
+		sbx.Spec.AutoPausePolicy.Resume.OnIngressTraffic != nil
+}
+
+// WakeOnIngressTrafficPauseTimeout returns the auto-pause timeout to re-arm
+// after a traffic wake, or 0 when the rule does not set a positive value.
+func WakeOnIngressTrafficPauseTimeout(sbx *agentsv1alpha1.Sandbox) time.Duration {
+	if sbx == nil || sbx.Spec.AutoPausePolicy == nil || sbx.Spec.AutoPausePolicy.Resume == nil {
+		return 0
+	}
+	rule := sbx.Spec.AutoPausePolicy.Resume.OnIngressTraffic
+	if rule == nil || rule.PauseTimeout == nil || rule.PauseTimeout.Duration <= 0 {
+		return 0
+	}
+	return rule.PauseTimeout.Duration
 }
 
 // GetTemplateSpec resolves and returns the PodTemplateSpec from the EmbeddedSandboxTemplate.

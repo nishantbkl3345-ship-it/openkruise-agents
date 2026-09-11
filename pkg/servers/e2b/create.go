@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
@@ -35,6 +34,7 @@ import (
 	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
+	quotaspec "github.com/openkruise/agents/pkg/sandbox-manager/quota/spec"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
 	"github.com/openkruise/agents/pkg/servers/web"
 	"github.com/openkruise/agents/pkg/utils"
@@ -69,20 +69,6 @@ func mapInfraErrorToApiError(err error) *web.ApiError {
 	}
 }
 
-func validateCreateResourceOverride(request models.NewSandboxRequest) *web.ApiError {
-	res := request.Extensions.InplaceUpdate.Resources
-	if res == nil {
-		return nil
-	}
-	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
-		return &web.ApiError{Code: http.StatusBadRequest, Message: "memory inplace update is not supported"}
-	}
-	if _, ok := res.Limits[corev1.ResourceMemory]; ok {
-		return &web.ApiError{Code: http.StatusBadRequest, Message: "memory inplace update is not supported"}
-	}
-	return nil
-}
-
 // resolveServerTimeout maps an extension-provided seconds value to a server-side
 // timeout. A positive value yields a finite timeout; an absent (zero) or
 // non-positive value yields noServerTimeout.
@@ -107,9 +93,6 @@ func (sc *Controller) CreateSandbox(r *http.Request) (web.ApiResponse[*models.Sa
 	request, parseErr := sc.parseCreateSandboxRequest(r)
 	if parseErr != nil {
 		return web.ApiResponse[*models.Sandbox]{}, parseErr
-	}
-	if validateErr := validateCreateResourceOverride(request); validateErr != nil {
-		return web.ApiResponse[*models.Sandbox]{}, validateErr
 	}
 	domain, apiErr := sc.resolveSandboxDomain(r)
 	if apiErr != nil {
@@ -225,7 +208,7 @@ func (sc *Controller) createSandboxWithClaim(ctx context.Context, request models
 
 	// Create network CRs (TrafficPolicy) if network config is provided.
 	// Network policy creation failure must fail the sandbox creation and killed the sandbox.
-	if apiErr := createNetworkPolicyForSandbox(ctx, sbx, request, log); apiErr != nil {
+	if apiErr := sc.createNetworkPolicyForSandbox(ctx, sbx, user, request, log); apiErr != nil {
 		return web.ApiResponse[*models.Sandbox]{}, apiErr
 	}
 
@@ -239,7 +222,7 @@ func (sc *Controller) createSandboxWithClone(ctx context.Context, request models
 	log := klog.FromContext(ctx)
 	start := time.Now()
 
-	if request.Extensions.InplaceUpdate.Image != "" {
+	if request.Extensions.InplaceUpdate.Image != "" || request.Extensions.InplaceUpdate.Resources != nil {
 		return web.ApiResponse[*models.Sandbox]{}, &web.ApiError{
 			Code:    http.StatusBadRequest,
 			Message: "InplaceUpdate is not supported for clone",
@@ -318,7 +301,7 @@ func (sc *Controller) createSandboxWithClone(ctx context.Context, request models
 
 	// Create network CRs (TrafficPolicy) if network config is provided.
 	// Network policy creation failure must fail the sandbox creation and killed the sandbox.
-	if apiErr := createNetworkPolicyForSandbox(ctx, sbx, request, log); apiErr != nil {
+	if apiErr := sc.createNetworkPolicyForSandbox(ctx, sbx, user, request, log); apiErr != nil {
 		return web.ApiResponse[*models.Sandbox]{}, apiErr
 	}
 
@@ -396,6 +379,18 @@ func (sc *Controller) parseCreateSandboxRequest(r *http.Request) (models.NewSand
 	}
 	request.Network = networkConfig
 
+	// Resolve security rules from either the native network.rules input or the
+	// e2b.agents.kruise.io/security-rules metadata JSON. The two inputs are
+	// mutually exclusive and normalize to one annotation value.
+	securityRulesJSON, err := resolveSecurityRules(&request)
+	if err != nil {
+		return request, &web.ApiError{
+			Code:    http.StatusBadRequest,
+			Message: err.Error(),
+		}
+	}
+	request.SecurityRulesJSON = securityRulesJSON
+
 	return request, nil
 }
 
@@ -422,8 +417,31 @@ func (sc *Controller) basicSandboxCreateModifier(ctx context.Context, sbx infra.
 	for k, v := range request.Metadata {
 		annotations[k] = v
 	}
+	if request.SecurityRulesJSON != "" {
+		annotations[agentsv1alpha1.AnnotationSecurityRules] = request.SecurityRulesJSON
+	} else {
+		// The claimed CR may come from the pool with a previous tenant's
+		// rules; recycle clears the key (AnnotationsClearedOnRecycle), and
+		// this delete keeps a missed recycle from inheriting them.
+		delete(annotations, agentsv1alpha1.AnnotationSecurityRules)
+	}
 	if request.Extensions.ReturnPodIP {
 		annotations[models.ExtensionKeyReturnPodIP] = agentsv1alpha1.True
+	}
+	if request.AutoResume.Enabled {
+		// The re-armed pause timeout only feeds the fresh PauseTime that the
+		// gateway wake path writes for auto-pause sandboxes; shutdown-only
+		// and never-timeout sandboxes never carry a PauseTime, so leave it
+		// unset for them: their wakes must not re-arm auto-pause.
+		var pauseTimeout time.Duration
+		if request.AutoPause && !request.Extensions.NeverTimeout && request.Timeout > 0 {
+			pauseTimeout = time.Duration(request.Timeout) * time.Second
+		}
+		sbx.EnableWakeOnIngressTraffic(pauseTimeout)
+	} else {
+		// Called on both branches so a claimed CR that still holds a
+		// previous delivery's rule is reset even if its recycle was skipped.
+		sbx.ClearWakeOnIngressTraffic()
 	}
 	sbx.SetAnnotations(annotations)
 
@@ -526,7 +544,7 @@ func (sc *Controller) injectStorageAuthAnnotation(sbx infra.Sandbox, key, value 
 // based on the request network config. On failure, the sandbox is killed to
 // prevent it from running without network policies, and an ApiError is returned.
 // Returns nil if no network config is provided or creation succeeds.
-func createNetworkPolicyForSandbox(ctx context.Context, sbx infra.Sandbox, request models.NewSandboxRequest, log klog.Logger) *web.ApiError {
+func (sc *Controller) createNetworkPolicyForSandbox(ctx context.Context, sbx infra.Sandbox, user *models.CreatedTeamAPIKey, request models.NewSandboxRequest, log klog.Logger) *web.ApiError {
 	if request.Network == nil {
 		return nil
 	}
@@ -536,7 +554,7 @@ func createNetworkPolicyForSandbox(ctx context.Context, sbx infra.Sandbox, reque
 	}); netErr != nil {
 		log.Error(netErr, "failed to create network policy, sandbox creation failed",
 			"sandboxID", sbx.GetSandboxID())
-		killed := killSandboxAfterFailure(ctx, sbx, log)
+		killed := sc.cleanUpSandboxAfterFailure(ctx, sbx, user, log)
 		return withSandboxResourceContext(&web.ApiError{
 			Code:    http.StatusInternalServerError,
 			Message: fmt.Sprintf("failed to create network policy: %v; clean up sandbox: %v", netErr, killed),
@@ -545,22 +563,37 @@ func createNetworkPolicyForSandbox(ctx context.Context, sbx infra.Sandbox, reque
 	return nil
 }
 
-// killSandboxAfterFailure attempts to delete a sandbox when a post-creation step
+// cleanUpSandboxAfterFailure attempts to delete a sandbox when a post-creation step
 // (e.g., network policy creation) fails, preventing orphaned sandboxes from
 // running without the intended security configuration. A fresh context with a
 // timeout is used when the original request context is already canceled.
-func killSandboxAfterFailure(ctx context.Context, sbx infra.Sandbox, log klog.Logger) bool {
+// It orchestrates cleanup through SandboxManager to release quota and remove proxy routes.
+func (sc *Controller) cleanUpSandboxAfterFailure(ctx context.Context, sbx infra.Sandbox, user *models.CreatedTeamAPIKey, log klog.Logger) bool {
 	cleanupCtx := ctx
 	if ctx.Err() != nil {
 		var cancel context.CancelFunc
 		cleanupCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 	}
-	if killErr := sbx.Kill(cleanupCtx); killErr != nil {
-		log.Error(killErr, "failed to kill sandbox after post-creation failure",
+
+	var quotaSpec *quotaspec.QuotaSpec
+	if user != nil && user.QuotaSpec != nil {
+		quotaSpec = user.QuotaSpec.DeepCopy()
+	}
+	userID := ""
+	if user != nil {
+		userID = user.ID.String()
+	}
+
+	if err := sc.manager.DeleteSandbox(cleanupCtx, sandboxmanager.DeleteSandboxOptions{
+		Sandbox: sbx,
+		User:    userID,
+		Quota:   quotaSpec,
+	}); err != nil {
+		log.Error(err, "failed to delete sandbox after post-creation failure",
 			"sandboxID", sbx.GetSandboxID())
 		return false
 	}
-	log.Info("sandbox killed after post-creation failure", "sandboxID", sbx.GetSandboxID())
+	log.Info("sandbox deleted after post-creation failure", "sandboxID", sbx.GetSandboxID())
 	return true
 }

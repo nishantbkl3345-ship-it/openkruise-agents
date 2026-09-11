@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/openkruise/agents/pkg/controller/commit"
+	"github.com/openkruise/agents/pkg/controller/poolautoscaler"
 	"github.com/openkruise/agents/pkg/controller/sandbox"
 	"github.com/openkruise/agents/pkg/controller/sandboxclaim"
 	"github.com/openkruise/agents/pkg/controller/sandboxset"
@@ -39,10 +40,11 @@ type Deps struct {
 }
 
 func SetupWithManager(m manager.Manager, deps Deps) error {
+	sbxMaxPendingTimeout := sandbox.MaxPendingTimeout()
 	if err := sandbox.Add(m, deps.MetricsCleanup, deps.RuntimeTLSBundle); err != nil {
 		return err
 	}
-	if err := sandboxset.Add(m); err != nil {
+	if err := sandboxset.Add(m, sbxMaxPendingTimeout); err != nil {
 		return err
 	}
 	if err := sandboxclaim.Add(m, deps.RuntimeTLSBundle); err != nil {
@@ -55,6 +57,9 @@ func SetupWithManager(m manager.Manager, deps Deps) error {
 		return err
 	}
 	if err := commit.Add(m); err != nil {
+		return err
+	}
+	if err := poolautoscaler.Add(m, sbxMaxPendingTimeout); err != nil {
 		return err
 	}
 	return nil
